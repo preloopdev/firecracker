@@ -249,7 +249,7 @@ fn verify_create_snapshot(
     let snapshot_params = CreateSnapshotParams {
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
-        mem_file_path: memory_file.as_path().to_path_buf(),
+        mem_file_path: Some(memory_file.as_path().to_path_buf()),
         sync_snapshot_files: true,
     };
 
@@ -433,6 +433,69 @@ fn get_microvm_state_from_snapshot(pci_enabled: bool) -> MicrovmState {
     // Deserialize the microVM state.
     snapshot_file.as_file().seek(SeekFrom::Start(0)).unwrap();
     Snapshot::load(&mut snapshot_file.as_file()).unwrap().data
+}
+
+fn verify_create_state_only_snapshot(pci_enabled: bool, memory_hotplug: bool) -> TempFile {
+    let snapshot_file = TempFile::new().unwrap();
+
+    let (vmm, _) = create_vmm(
+        Some(NOISY_KERNEL_IMAGE),
+        false,
+        true,
+        pci_enabled,
+        memory_hotplug,
+    );
+    let vm_info = VmInfo::from(&*vmm.lock().unwrap());
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    // Be sure that the microVM is running.
+    thread::sleep(Duration::from_millis(200));
+
+    // Pause microVM.
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    // Create state-only snapshot (no mem_file_path).
+    let snapshot_params = CreateSnapshotParams {
+        snapshot_type: SnapshotType::Full,
+        snapshot_path: snapshot_file.as_path().to_path_buf(),
+        mem_file_path: None,
+        sync_snapshot_files: true,
+    };
+
+    controller
+        .handle_request(VmmAction::CreateSnapshot(snapshot_params), &mut event_manager)
+        .unwrap();
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    // Verify that the snapshot file was created and contains valid state.
+    let restored_microvm_state: MicrovmState =
+        Snapshot::load(&mut snapshot_file.as_file()).unwrap().data;
+
+    assert_eq!(restored_microvm_state.vm_info, vm_info);
+    assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
+
+    snapshot_file
+}
+
+#[test]
+fn test_create_state_only_snapshot() {
+    for pci_enabled in [false, true] {
+        for memory_hotplug in [false, true] {
+            let snapshot_file =
+                verify_create_state_only_snapshot(pci_enabled, memory_hotplug);
+
+            // Verify the snapshot file is non-empty (state was written).
+            let snap_file_len = snapshot_file
+                .as_file()
+                .seek(SeekFrom::End(0))
+                .unwrap();
+            assert!(snap_file_len > 0);
+        }
+    }
 }
 
 fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &str) {

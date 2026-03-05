@@ -767,7 +767,8 @@ paths:
       summary: Creates a full or diff snapshot. Post-boot only.
       description:
         Creates a snapshot of the microVM state. The microVM should be
-        in the `Paused` state.
+        in the `Paused` state. If `mem_file_path` is not specified, only
+        the VM state is saved without dumping guest memory.
       operationId: createSnapshot
       parameters:
         - name: body
@@ -1664,12 +1665,11 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description: Path to the file that will contain the guest memory. If not specified, only the VM state is saved without memory.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
