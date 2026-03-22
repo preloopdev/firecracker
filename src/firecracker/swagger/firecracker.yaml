@@ -1271,6 +1271,14 @@ definitions:
         default: 512
       topology:
         $ref: "#/definitions/BlockTopology"
+      direct:
+        type: boolean
+        description:
+          When set to true, the backing file is opened with O_DIRECT, bypassing
+          the host page cache. A bounce buffer is used automatically for guest
+          memory buffers that do not meet alignment requirements.
+          This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
+        default: false
 
       # VhostUserBlock specific parameters
       socket:

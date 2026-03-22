@@ -68,6 +68,10 @@ pub struct BlockDeviceConfig {
     pub blk_size: Option<u32>,
     /// Block topology settings
     pub topology: Option<VirtioBlkTopology>,
+    /// When set to true, the backing file is opened with O_DIRECT, bypassing
+    /// the host page cache. A bounce buffer is used for unaligned guest buffers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<bool>,
 
     // VhostUserBlock specific fields
     /// Path to the vhost-user socket.
@@ -223,6 +227,7 @@ mod tests {
                 file_engine_type: self.file_engine_type,
                 blk_size: self.blk_size,
                 topology: self.topology,
+                direct: self.direct,
 
                 socket: self.socket.clone(),
             }
@@ -253,6 +258,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -290,6 +296,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -325,6 +332,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -357,6 +365,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -376,6 +385,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -406,6 +416,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -425,6 +436,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -444,6 +456,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -488,6 +501,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -507,6 +521,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -526,6 +541,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -571,6 +587,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -590,6 +607,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -665,6 +683,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -684,6 +703,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -718,6 +738,7 @@ mod tests {
                 min_io_size: 0,
                 opt_io_size: 128,
             }),
+            direct: None,
 
             socket: None,
         };
@@ -751,6 +772,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };

@@ -64,6 +64,10 @@ pub struct VirtioBlockState {
     blk_size: u32,
     topology: VirtioBlkTopology,
     discard_sector_alignment: u32,
+    /// Whether O_DIRECT was used to open the backing file.
+    /// Uses serde default (false) for backward compatibility with older snapshots.
+    #[serde(default)]
+    direct: bool,
 }
 
 impl Persist<'_> for VirtioBlock {
@@ -85,6 +89,7 @@ impl Persist<'_> for VirtioBlock {
             blk_size: self.config_space.blk_size,
             topology: self.config_space.topology,
             discard_sector_alignment: self.config_space.discard_sector_alignment,
+            direct: self.direct,
         }
     }
 
@@ -100,6 +105,7 @@ impl Persist<'_> for VirtioBlock {
             state.disk_path.clone(),
             is_read_only,
             state.file_engine_type.into(),
+            state.direct,
         )?;
 
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
@@ -140,6 +146,7 @@ impl Persist<'_> for VirtioBlock {
             cache_type: state.cache_type,
             root_device: state.root_device,
             read_only: is_read_only,
+            direct: state.direct,
 
             disk: disk_properties,
             rate_limiter,
@@ -176,6 +183,7 @@ mod tests {
             file_engine_type: FileEngineType::default(),
             blk_size: None,
             topology: None,
+            direct: false,
         };
 
         let block = VirtioBlock::new(config).unwrap();
@@ -220,6 +228,7 @@ mod tests {
             file_engine_type: FileEngineType::default(),
             blk_size: None,
             topology: None,
+            direct: false,
         };
 
         let block = VirtioBlock::new(config).unwrap();

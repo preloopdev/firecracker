@@ -563,6 +563,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
         file_engine_type: None,
         blk_size: None,
         topology: None,
+        direct: None,
 
         socket: None,
     };

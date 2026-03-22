@@ -4,14 +4,89 @@
 pub mod async_io;
 pub mod sync_io;
 
+use std::alloc::{Layout, alloc, dealloc};
 use std::fmt::Debug;
 use std::fs::File;
+
+/// Required alignment for O_DIRECT I/O: 512 bytes (one sector).
+/// Both the file offset and the I/O buffer address must be multiples of this
+/// value (offsets and lengths are already guaranteed by the virtio-blk protocol;
+/// only buffer addresses may need a bounce buffer).
+pub const DIRECT_IO_ALIGN: usize = 512;
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+
+/// A heap-allocated buffer with a guaranteed start-address alignment.
+///
+/// Used as a bounce buffer for O_DIRECT I/O when guest memory addresses do not
+/// satisfy the kernel's alignment requirements. The buffer is allocated on
+/// construction and freed when dropped.
+pub struct AlignedBuf {
+    ptr: *mut u8,
+    /// Number of meaningful bytes (the caller's requested length).
+    len: usize,
+    layout: Layout,
+}
+
+// SAFETY: The raw pointer is exclusively owned by this struct and not shared.
+unsafe impl Send for AlignedBuf {}
+unsafe impl Sync for AlignedBuf {}
+
+impl std::fmt::Debug for AlignedBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlignedBuf")
+            .field("ptr", &self.ptr)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl AlignedBuf {
+    /// Allocate a buffer of `len` bytes with the given `alignment`.
+    ///
+    /// The allocated size is rounded up to a multiple of `alignment` so that
+    /// both the pointer and the length meet O_DIRECT requirements.
+    ///
+    /// Returns `None` if `alignment` is not a power of two, or if the system
+    /// allocator fails.
+    pub fn new(len: usize, alignment: usize) -> Option<Self> {
+        // Round up to the next multiple of `alignment` so the buffer length
+        // also satisfies O_DIRECT's length-alignment requirement.
+        let aligned_len = len.next_multiple_of(alignment);
+        let layout = Layout::from_size_align(aligned_len, alignment).ok()?;
+        // SAFETY: layout is valid (non-zero size, power-of-two alignment).
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(AlignedBuf { ptr, len, layout })
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: ptr is valid for `len` bytes (allocated above).
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr is valid for `len` bytes (allocated above).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: ptr and layout come from the matching alloc call in new().
+        unsafe { dealloc(self.ptr, self.layout) };
+    }
+}
 
 #[derive(Debug)]
 pub struct RequestOk {
@@ -57,19 +132,25 @@ pub enum FileEngine {
 }
 
 impl FileEngine {
-    pub fn from_file(file: File, engine_type: FileEngineType) -> Result<FileEngine, BlockIoError> {
+    pub fn from_file(
+        file: File,
+        engine_type: FileEngineType,
+        direct: bool,
+    ) -> Result<FileEngine, BlockIoError> {
         match engine_type {
             FileEngineType::Async => Ok(FileEngine::Async(
-                AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
+                AsyncFileEngine::from_file(file, direct).map_err(BlockIoError::Async)?,
             )),
-            FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
+            FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file, direct))),
         }
     }
 
-    pub fn update_file_path(&mut self, file: File) -> Result<(), BlockIoError> {
+    pub fn update_file_path(&mut self, file: File, direct: bool) -> Result<(), BlockIoError> {
         match self {
-            FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
-            FileEngine::Sync(engine) => engine.update_file(file),
+            FileEngine::Async(engine) => {
+                engine.update_file(file, direct).map_err(BlockIoError::Async)?
+            }
+            FileEngine::Sync(engine) => engine.update_file(file, direct),
         };
 
         Ok(())
@@ -277,7 +358,7 @@ pub mod tests {
         let mem = create_mem();
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Sync).unwrap();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Sync, false).unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()
@@ -361,7 +442,7 @@ pub mod tests {
     fn test_async() {
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Async).unwrap();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Async, false).unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()
