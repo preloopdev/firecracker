@@ -8,7 +8,9 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
-use super::persist::{create_snapshot, restore_from_snapshot};
+use super::persist::{
+    GuestRegionUffdMapping, build_uffd_mappings, create_snapshot, restore_from_snapshot,
+};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -24,6 +26,7 @@ use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::HotplugDeviceConfig;
+use crate::vstate::memory::GuestMemory;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -71,6 +74,8 @@ pub enum VmmAction {
     GetBalloonStats,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
+    /// Get guest memory region mappings. Post-boot only.
+    GetGuestMemoryRegions,
     /// Get MMDS contents.
     GetMMDS,
     /// Get the machine configuration of the microVM.
@@ -233,6 +238,8 @@ pub enum VmmData {
     Empty,
     /// The complete microVM configuration in JSON format.
     FullVmConfig(VmmConfig),
+    /// The guest memory region mappings.
+    GuestMemoryRegions(Vec<GuestRegionUffdMapping>),
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(MachineConfig),
     /// Mmds contents.
@@ -502,6 +509,7 @@ impl<'a> PrebootApiController<'a> {
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
             | FlushMetrics
+            | GetGuestMemoryRegions
             | Pause
             | Resume
             | GetBalloonStats
@@ -721,6 +729,7 @@ impl RuntimeApiController {
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
+            GetGuestMemoryRegions => self.get_guest_memory_regions(),
             GetMemoryHotplugStatus => self
                 .vmm
                 .lock()
@@ -954,6 +963,25 @@ impl RuntimeApiController {
             }
         }
         Ok(VmmData::Empty)
+    }
+
+    /// Returns guest memory region mappings for external use (e.g., reading
+    /// guest memory via `process_vm_readv()` or populating snapshot data).
+    ///
+    /// The `offset` field in each returned mapping is a cumulative byte offset into
+    /// a contiguous layout of all regions (i.e., the position where this region's
+    /// data would start if all regions were concatenated in order). This matches
+    /// the semantics used in the uffd restore path (`create_guest_memory` in
+    /// `persist.rs`), where `offset` represents the position within the snapshot
+    /// file/buffer — **not** the Guest Physical Address (GPA). Note that GPAs may
+    /// have gaps (e.g., the MMIO hole near 4 GiB), but the snapshot layout is
+    /// contiguous.
+    fn get_guest_memory_regions(&self) -> Result<VmmData, VmmActionError> {
+        let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+        let guest_memory = locked_vmm.vm.guest_memory();
+        let huge_pages = self.vm_resources.machine_config.huge_pages;
+        let mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
+        Ok(VmmData::GuestMemoryRegions(mappings))
     }
 
     /// Updates block device properties:
@@ -1211,6 +1239,7 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::Pause));
         check_unsupported(preboot_request(VmmAction::Resume));
         check_unsupported(preboot_request(VmmAction::GetBalloonStats));
+        check_unsupported(preboot_request(VmmAction::GetGuestMemoryRegions));
         check_unsupported(preboot_request(VmmAction::UpdateBalloon(
             BalloonUpdateConfig { amount_mib: 0 },
         )));
@@ -1267,6 +1296,28 @@ mod tests {
             runtime_request(VmmAction::GetVmMachineConfig).unwrap(),
             VmmData::MachineConfiguration(MachineConfig::default())
         );
+    }
+
+    #[test]
+    fn test_runtime_get_guest_memory_regions() {
+        let result = runtime_request(VmmAction::GetGuestMemoryRegions).unwrap();
+        match result {
+            VmmData::GuestMemoryRegions(regions) => {
+                assert!(!regions.is_empty());
+                let mut expected_offset = 0u64;
+                for region in &regions {
+                    assert_ne!(region.base_host_virt_addr, 0);
+                    assert_ne!(region.size, 0);
+                    assert_eq!(region.page_size, 4096);
+                    assert_eq!(
+                        region.offset, expected_offset,
+                        "offset should be cumulative sum of preceding region sizes"
+                    );
+                    expected_offset += region.size as u64;
+                }
+            }
+            other => panic!("Expected GuestMemoryRegions, got {:?}", other),
+        }
     }
 
     #[test]

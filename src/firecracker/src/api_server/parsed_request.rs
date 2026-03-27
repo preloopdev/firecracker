@@ -85,9 +85,16 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "", None) => parse_get_instance_info(),
             (Method::Get, "balloon", None) => parse_get_balloon(path_tokens),
             (Method::Get, "version", None) => parse_get_version(),
-            (Method::Get, "vm", None) if path_tokens.next() == Some("config") => {
-                Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
-            }
+            (Method::Get, "vm", None) => match path_tokens.next() {
+                Some("config") => Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig)),
+                Some("guest-memory-regions") => {
+                    Ok(ParsedRequest::new_sync(VmmAction::GetGuestMemoryRegions))
+                }
+                _ => Err(RequestError::InvalidPathMethod(
+                    "vm".to_string(),
+                    Method::Get,
+                )),
+            },
             (Method::Get, "machine-config", None) => parse_get_machine_config(),
             (Method::Get, "mmds", None) => parse_get_mmds(),
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
@@ -211,6 +218,9 @@ impl ParsedRequest {
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+                VmmData::GuestMemoryRegions(regions) => {
+                    Self::success_response_with_data(regions)
+                }
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -366,6 +376,7 @@ pub mod tests {
     use vmm::vmm_config::balloon::{BalloonDeviceConfig, BalloonStats};
     use vmm::vmm_config::instance_info::InstanceInfo;
     use vmm::vmm_config::machine_config::MachineConfig;
+    use vmm::persist::GuestRegionUffdMapping;
 
     use super::*;
 
@@ -616,6 +627,9 @@ pub mod tests {
                 VmmData::FullVmConfig(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
                 }
+                VmmData::GuestMemoryRegions(regions) => {
+                    http_response(&serde_json::to_string(regions).unwrap(), 200)
+                }
                 VmmData::MachineConfiguration(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
                 }
@@ -650,6 +664,16 @@ pub mod tests {
         verify_ok_response_with(VmmData::MmdsValue(serde_json::from_str("{}").unwrap()));
         verify_ok_response_with(VmmData::InstanceInformation(InstanceInfo::default()));
         verify_ok_response_with(VmmData::VmmVersion(String::default()));
+        #[allow(deprecated)]
+        verify_ok_response_with(VmmData::GuestMemoryRegions(vec![
+            GuestRegionUffdMapping {
+                base_host_virt_addr: 0x7f0000000000,
+                size: 0x10000000,
+                offset: 0,
+                page_size: 4096,
+                page_size_kib: 4096,
+            },
+        ]));
 
         // Error.
         let error = VmmActionError::StartMicrovm(StartMicrovmError::MissingKernelConfig);
@@ -744,6 +768,22 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_get_guest_memory_regions() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/vm/guest-memory-regions", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed),
+            VmmAction::GetGuestMemoryRegions
+        );
     }
 
     #[test]

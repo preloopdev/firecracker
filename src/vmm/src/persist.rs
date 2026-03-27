@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
+use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -40,7 +41,7 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestMemoryState, GuestMmapRegion, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -588,17 +589,22 @@ fn guest_memory_from_uffd(
     Ok((guest_memory, Some(uffd)))
 }
 
-fn create_guest_memory(
-    mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
+/// Builds a list of [`GuestRegionUffdMapping`]s from an iterator of memory regions.
+///
+/// Each mapping records the host virtual address, region size, cumulative byte
+/// offset within a contiguous layout of all regions, and the page size from the
+/// given [`HugePageConfig`]. This is the single source of truth for constructing
+/// these mappings — used by both the uffd restore path and the runtime
+/// `GET /vm/guest-memory-regions` API.
+pub fn build_uffd_mappings<'a, R: Deref<Target = GuestMmapRegion> + 'a>(
+    regions: impl Iterator<Item = &'a R>,
     huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
-    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
+) -> Vec<GuestRegionUffdMapping> {
+    let mut mappings = Vec::new();
     let mut offset = 0;
-    for mem_region in guest_memory.iter() {
+    for mem_region in regions {
         #[allow(deprecated)]
-        backend_mappings.push(GuestRegionUffdMapping {
+        mappings.push(GuestRegionUffdMapping {
             base_host_virt_addr: mem_region.as_ptr() as u64,
             size: mem_region.size(),
             offset,
@@ -607,7 +613,16 @@ fn create_guest_memory(
         });
         offset += mem_region.size() as u64;
     }
+    mappings
+}
 
+fn create_guest_memory(
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
+    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let backend_mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
     Ok((guest_memory, backend_mappings))
 }
 
@@ -852,5 +867,35 @@ mod tests {
             serde_json::from_slice(&message_buf).unwrap();
 
         assert_eq!(uffd_regions, deserialized);
+    }
+
+    #[test]
+    fn test_build_uffd_mappings() {
+        use vm_memory::GuestAddress;
+
+        let regions = memory::anonymous(
+            [(GuestAddress(0), 0x10000), (GuestAddress(0x10000), 0x20000)]
+                .iter()
+                .copied(),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+
+        let mappings = build_uffd_mappings(regions.iter(), HugePageConfig::None);
+
+        assert_eq!(mappings.len(), 2);
+
+        // First region: offset starts at 0.
+        assert_ne!(mappings[0].base_host_virt_addr, 0);
+        assert_eq!(mappings[0].size, 0x10000);
+        assert_eq!(mappings[0].offset, 0);
+        assert_eq!(mappings[0].page_size, 4096);
+
+        // Second region: offset is cumulative (== first region's size).
+        assert_ne!(mappings[1].base_host_virt_addr, 0);
+        assert_eq!(mappings[1].size, 0x20000);
+        assert_eq!(mappings[1].offset, 0x10000);
+        assert_eq!(mappings[1].page_size, 4096);
     }
 }

@@ -855,6 +855,33 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/guest-memory-regions:
+    get:
+      summary: Returns guest memory region mappings.
+      description:
+        Returns the host virtual address mappings for all guest memory regions.
+        These mappings can be used by external processes to read guest memory
+        directly from the Firecracker process address space (e.g. via
+        process_vm_readv()), or to construct snapshot memory files. The offset
+        field represents a cumulative byte position in a contiguous layout,
+        not the Guest Physical Address. Post-boot only.
+      operationId: getGuestMemoryRegions
+      responses:
+        200:
+          description: Guest memory region mappings
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/GuestRegionUffdMapping"
+        400:
+          description: VM is not in a valid state for this operation
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /vm/config:
     get:
       summary: Gets the full VM configuration.
@@ -1342,6 +1369,44 @@ definitions:
         type: string
         description: A description of the error condition
         readOnly: true
+
+  GuestRegionUffdMapping:
+    type: object
+    description:
+      Describes a guest memory region mapping, providing the host virtual address,
+      region size, offset within a contiguous snapshot layout, and page size. Used
+      by external processes to read guest memory directly from the Firecracker
+      process address space via process_vm_readv().
+    required:
+      - base_host_virt_addr
+      - size
+      - offset
+      - page_size
+    properties:
+      base_host_virt_addr:
+        type: integer
+        format: int64
+        description: Base host virtual address of the guest memory region.
+      size:
+        type: integer
+        format: int64
+        description: Region size in bytes.
+      offset:
+        type: integer
+        format: int64
+        description:
+          Cumulative byte offset of this region within a contiguous layout of all
+          guest memory regions. This is the position where this region's data
+          starts if all regions are concatenated in iteration order, matching the
+          offset semantics used in the uffd restore path (snapshot file layout).
+          Note this is NOT the Guest Physical Address — GPAs may contain gaps
+          (e.g. the MMIO hole near 4 GiB) absent from the contiguous layout.
+      page_size:
+        type: integer
+        description: Page size for this region (typically 4096).
+      page_size_kib:
+        type: integer
+        description: Deprecated. Same value as page_size. Will be removed in 2.0.
 
   FullVmConfiguration:
     type: object
