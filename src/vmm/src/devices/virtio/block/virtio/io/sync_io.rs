@@ -101,7 +101,7 @@ impl SyncFileEngine {
 
     /// Returns true if the guest memory address requires a bounce buffer for O_DIRECT.
     fn needs_bounce_buf(&self, addr: GuestAddress) -> bool {
-        self.direct && !(addr.0 as usize).is_multiple_of(DIRECT_IO_ALIGN)
+        self.direct && !addr.0.is_multiple_of(DIRECT_IO_ALIGN as u64)
     }
 
     pub fn read(

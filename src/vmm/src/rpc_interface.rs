@@ -979,7 +979,7 @@ impl RuntimeApiController {
     fn get_guest_memory_regions(&self) -> Result<VmmData, VmmActionError> {
         let locked_vmm = self.vmm.lock().expect("Poisoned lock");
         let guest_memory = locked_vmm.vm.guest_memory();
-        let huge_pages = self.vm_resources.machine_config.huge_pages;
+        let huge_pages = locked_vmm.machine_config.huge_pages;
         let mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
         Ok(VmmData::GuestMemoryRegions(mappings))
     }

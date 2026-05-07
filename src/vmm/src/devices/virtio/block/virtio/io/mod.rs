@@ -34,6 +34,7 @@ pub struct AlignedBuf {
 
 // SAFETY: The raw pointer is exclusively owned by this struct and not shared.
 unsafe impl Send for AlignedBuf {}
+// SAFETY: The raw pointer is exclusively owned by this struct and not shared.
 unsafe impl Sync for AlignedBuf {}
 
 impl std::fmt::Debug for AlignedBuf {

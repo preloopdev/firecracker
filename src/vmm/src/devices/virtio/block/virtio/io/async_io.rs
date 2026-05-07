@@ -15,7 +15,9 @@ use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
 use crate::logger::log_dev_preview_warning;
-use crate::vstate::memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
+use crate::vstate::memory::{
+    Bytes, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap,
+};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum AsyncIoError {
@@ -87,26 +89,34 @@ impl WrappedRequest {
     }
 
     fn mark_dirty_mem_and_unwrap(
-        mut self,
+        self,
         mem: &GuestMemoryMmap,
         count: u32,
-    ) -> PendingRequest {
-        if let Some(addr) = self.addr {
+    ) -> Result<PendingRequest, RequestError<AsyncIoError>> {
+        let WrappedRequest {
+            addr,
+            req,
+            bounce_buf,
+        } = self;
+
+        if let Some(addr) = addr {
             // If there is a bounce buffer, this was a read: copy data to guest memory.
-            if let Some(ref bounce) = self.bounce_buf {
+            if let Some(ref bounce) = bounce_buf {
                 let data = &bounce.as_slice()[..count as usize];
                 if let Err(err) = mem.write_slice(data, addr) {
                     crate::logger::error!(
                         "Failed to copy bounce buffer to guest memory: {:?}",
                         err
                     );
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::GuestMemory(err),
+                    });
                 }
             }
             mem.mark_dirty(addr, count as usize);
         }
-        // Drop bounce_buf here, freeing the aligned allocation.
-        self.bounce_buf = None;
-        self.req
+        Ok(req)
     }
 }
 
@@ -166,7 +176,7 @@ impl AsyncFileEngine {
 
     /// Returns true if the guest address requires a bounce buffer for O_DIRECT.
     fn needs_bounce_buf(&self, addr: GuestAddress) -> bool {
-        self.direct && !(addr.0 as usize).is_multiple_of(DIRECT_IO_ALIGN)
+        self.direct && !addr.0.is_multiple_of(DIRECT_IO_ALIGN as u64)
     }
 
     pub fn push_read(
@@ -182,7 +192,12 @@ impl AsyncFileEngine {
             // On completion, the data will be copied to guest memory in pop().
             let bounce = match AlignedBuf::new(count as usize, DIRECT_IO_ALIGN) {
                 Some(b) => b,
-                None => return Err(RequestError { req, error: AsyncIoError::BounceBufferAlloc }),
+                None => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::BounceBufferAlloc,
+                    });
+                }
             };
             let buf_ptr = bounce.as_ptr();
             let wrapped_user_data = WrappedRequest::new_with_bounce_buf(addr, req, bounce);
@@ -239,7 +254,12 @@ impl AsyncFileEngine {
             // Copy guest data into an aligned bounce buffer, then submit write from it.
             let mut bounce = match AlignedBuf::new(count as usize, DIRECT_IO_ALIGN) {
                 Some(b) => b,
-                None => return Err(RequestError { req, error: AsyncIoError::BounceBufferAlloc }),
+                None => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::BounceBufferAlloc,
+                    });
+                }
             };
             if let Err(err) = mem.read_slice(bounce.as_mut_slice(), addr) {
                 return Err(RequestError {
@@ -350,13 +370,22 @@ impl AsyncFileEngine {
         &mut self,
         mem: &GuestMemoryMmap,
     ) -> Result<Option<Cqe<PendingRequest>>, AsyncIoError> {
-        let cqe = self.do_pop()?.map(|cqe| {
-            let count = cqe.count();
-            cqe.map_user_data(|wrapped_user_data| {
-                wrapped_user_data.mark_dirty_mem_and_unwrap(mem, count)
-            })
-        });
-
-        Ok(cqe)
+        let Some(cqe) = self.do_pop()? else {
+            return Ok(None);
+        };
+        let count = cqe.count();
+        let result = cqe.result();
+        let wrapped_request = cqe.user_data();
+        let req = match wrapped_request.mark_dirty_mem_and_unwrap(mem, count) {
+            Ok(req) => req,
+            Err(err) => {
+                return Ok(Some(Cqe::new(-libc::EFAULT, err.req)));
+            }
+        };
+        Ok(Some(match result {
+            // SAFETY: result() just convert it from i32
+            Ok(count) => Cqe::new(i32::try_from(count).unwrap(), req),
+            Err(err) => Cqe::new(err.raw_os_error().unwrap_or(-libc::EIO), req),
+        }))
     }
 }
