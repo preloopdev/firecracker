@@ -882,6 +882,31 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/dirty-memory-ranges:
+    get:
+      summary: Returns dirty guest memory ranges.
+      description:
+        Returns dirty guest memory ranges in the same contiguous image layout
+        used by Firecracker memory snapshots. Each range includes the host
+        virtual address to read from and the destination image offset. This API
+        is intended for paused, post-boot VMs during snapshot creation. The
+        query is logically non-clearing; dirty pages remain dirty for a later
+        snapshot if the external consumer fails.
+      operationId: getDirtyMemoryRanges
+      responses:
+        200:
+          description: Dirty guest memory ranges
+          schema:
+            $ref: "#/definitions/DirtyMemoryRanges"
+        400:
+          description: VM is not in a valid state for this operation
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /vm/config:
     get:
       summary: Gets the full VM configuration.
@@ -1407,6 +1432,53 @@ definitions:
       page_size_kib:
         type: integer
         description: Deprecated. Same value as page_size. Will be removed in 2.0.
+
+  DirtyMemoryRange:
+    type: object
+    description:
+      Describes a contiguous dirty memory range in Firecracker host memory and
+      its destination offset in the contiguous snapshot image layout.
+    required:
+      - base_host_virt_addr
+      - image_offset
+      - length
+    properties:
+      base_host_virt_addr:
+        type: integer
+        format: int64
+        description: Base host virtual address of the dirty range.
+      image_offset:
+        type: integer
+        format: int64
+        description:
+          Cumulative byte offset of this range in the contiguous memory snapshot
+          image layout. This is not a Guest Physical Address.
+      length:
+        type: integer
+        format: int64
+        description: Dirty range length in bytes.
+
+  DirtyMemoryRanges:
+    type: object
+    description:
+      Dirty memory ranges for a VM, using the same contiguous memory image
+      layout as snapshot files.
+    required:
+      - page_size
+      - memory_size
+      - ranges
+    properties:
+      page_size:
+        type: integer
+        description: Page size used to interpret dirty bits.
+      memory_size:
+        type: integer
+        format: int64
+        description: Total byte size of the contiguous memory snapshot image.
+      ranges:
+        type: array
+        items:
+          $ref: "#/definitions/DirtyMemoryRange"
 
   FullVmConfiguration:
     type: object

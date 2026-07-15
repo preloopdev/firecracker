@@ -49,6 +49,8 @@ use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
+use crate::vstate::memory::{DirtyMemoryRanges, GuestMemory};
+use crate::vstate::vm::VmError;
 
 /// This enum represents the public interface of the VMM. Each action contains various
 /// bits of information (ids, paths, etc.).
@@ -74,6 +76,8 @@ pub enum VmmAction {
     GetBalloonStats,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
+    /// Get dirty guest memory ranges. Post-boot only.
+    GetDirtyMemoryRanges,
     /// Get guest memory region mappings. Post-boot only.
     GetGuestMemoryRegions,
     /// Get MMDS contents.
@@ -171,6 +175,8 @@ pub enum VmmActionError {
     BootSource(#[from] BootSourceConfigError),
     /// Create snapshot error: {0}
     CreateSnapshot(#[from] CreateSnapshotError),
+    /// Dirty memory ranges error: {0}
+    DirtyMemoryRanges(#[from] VmError),
     /// Configure CPU error: {0}
     ConfigureCpu(#[from] GuestConfigError),
     /// Drive config error: {0}
@@ -238,6 +244,8 @@ pub enum VmmData {
     Empty,
     /// The complete microVM configuration in JSON format.
     FullVmConfig(VmmConfig),
+    /// The dirty guest memory ranges.
+    DirtyMemoryRanges(DirtyMemoryRanges),
     /// The guest memory region mappings.
     GuestMemoryRegions(Vec<GuestRegionUffdMapping>),
     /// The microVM configuration represented by `VmConfig`.
@@ -509,6 +517,7 @@ impl<'a> PrebootApiController<'a> {
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
             | FlushMetrics
+            | GetDirtyMemoryRanges
             | GetGuestMemoryRegions
             | Pause
             | Resume
@@ -729,6 +738,7 @@ impl RuntimeApiController {
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
+            GetDirtyMemoryRanges => self.get_dirty_memory_ranges(),
             GetGuestMemoryRegions => self.get_guest_memory_regions(),
             GetMemoryHotplugStatus => self
                 .vmm
@@ -982,6 +992,17 @@ impl RuntimeApiController {
         let huge_pages = locked_vmm.machine_config.huge_pages;
         let mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
         Ok(VmmData::GuestMemoryRegions(mappings))
+    }
+
+    /// Returns dirty memory ranges for external snapshot packaging.
+    ///
+    /// The query is logically non-clearing: if reading KVM's dirty log clears
+    /// KVM state, the VM stores those dirty bits back into Firecracker's
+    /// internal bitmap before this method returns.
+    fn get_dirty_memory_ranges(&self) -> Result<VmmData, VmmActionError> {
+        let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+        let ranges = locked_vmm.vm.get_dirty_memory_ranges_preserve()?;
+        Ok(VmmData::DirtyMemoryRanges(ranges))
     }
 
     /// Updates block device properties:
@@ -1239,6 +1260,7 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::Pause));
         check_unsupported(preboot_request(VmmAction::Resume));
         check_unsupported(preboot_request(VmmAction::GetBalloonStats));
+        check_unsupported(preboot_request(VmmAction::GetDirtyMemoryRanges));
         check_unsupported(preboot_request(VmmAction::GetGuestMemoryRegions));
         check_unsupported(preboot_request(VmmAction::UpdateBalloon(
             BalloonUpdateConfig { amount_mib: 0 },
@@ -1317,6 +1339,18 @@ mod tests {
                 }
             }
             other => panic!("Expected GuestMemoryRegions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_runtime_get_dirty_memory_ranges() {
+        let result = runtime_request(VmmAction::GetDirtyMemoryRanges).unwrap();
+        match result {
+            VmmData::DirtyMemoryRanges(dirty_ranges) => {
+                assert_eq!(dirty_ranges.page_size, 4096);
+                assert_ne!(dirty_ranges.memory_size, 0);
+            }
+            other => panic!("Expected DirtyMemoryRanges, got {:?}", other),
         }
     }
 
