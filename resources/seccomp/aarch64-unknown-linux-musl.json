@@ -1347,6 +1347,18 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
+                        "val": 3225464533,
+                        "comment": "KVM_PRE_FAULT_MEMORY"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
                         "val": 2147790488,
                         "comment": "KVM_GET_MP_STATE"
                     }

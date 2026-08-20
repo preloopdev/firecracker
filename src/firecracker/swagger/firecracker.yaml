@@ -855,6 +855,34 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/pre-fault-memory:
+    put:
+      summary: Pre-fault selected guest memory.
+      description:
+        Pre-faults the requested guest-physical ranges while the microVM is
+        paused. Ranges must be non-empty, non-zero, 4096-byte aligned, and
+        fully covered by plugged guest RAM. The request does not sort, merge,
+        or deduplicate ranges. This operation is available on x86_64 hosts
+        whose KVM exposes KVM_CAP_PRE_FAULT_MEMORY.
+      operationId: putPreFaultMemory
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/PreFaultMemoryRequest"
+      responses:
+        204:
+          description: Pre-fault completed successfully.
+        400:
+          description: Invalid request, unsupported host capability, or VM state.
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /vm/guest-memory-regions:
     get:
       summary: Returns guest memory region mappings.
@@ -1432,6 +1460,38 @@ definitions:
       page_size_kib:
         type: integer
         description: Deprecated. Same value as page_size. Will be removed in 2.0.
+
+  PreFaultMemoryRange:
+    type: object
+    description: Guest-physical memory range to pre-fault.
+    additionalProperties: false
+    required:
+      - gpa
+      - size
+    properties:
+      gpa:
+        type: integer
+        format: int64
+        minimum: 0
+        description: 4096-byte-aligned guest physical address.
+      size:
+        type: integer
+        format: int64
+        minimum: 4096
+        description: Non-zero size in bytes, aligned to 4096 bytes.
+
+  PreFaultMemoryRequest:
+    type: object
+    description: Ranges to pre-fault on a paused microVM.
+    additionalProperties: false
+    required:
+      - ranges
+    properties:
+      ranges:
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/definitions/PreFaultMemoryRange"
 
   DirtyMemoryRange:
     type: object

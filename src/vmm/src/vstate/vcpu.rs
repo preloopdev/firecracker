@@ -27,6 +27,8 @@ use crate::logger::{IncMetric, METRICS, error, info, warn};
 use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::vstate::bus::Bus;
+use crate::vstate::prefault::pre_fault_memory;
+use crate::vstate::prefault::{PreFaultMemoryIoctlError, PreFaultMemoryRange};
 use crate::vstate::vm::KvmVm;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
@@ -48,6 +50,8 @@ pub enum VcpuError {
     UnhandledKvmExit(String),
     /// Failed to run action on vcpu: {0}
     VcpuResponse(KvmVcpuError),
+    /// Failed to pre-fault guest memory: {0}
+    PreFaultMemory(PreFaultMemoryIoctlError),
     /// Cannot spawn a new vCPU thread: {0}
     VcpuSpawn(io::Error),
     /// Vcpu not present in TLS
@@ -301,6 +305,14 @@ impl Vcpu {
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
+            // Pre-faulting cannot be performed on a running Vcpu.
+            Ok(VcpuEvent::PreFaultMemory(_)) => {
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "pre-fault memory requires a paused vCPU",
+                    )))
+                    .expect("vcpu channel unexpectedly closed");
+            }
             Ok(VcpuEvent::Finish) => return VcpuRunState::Finished,
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
@@ -366,6 +378,21 @@ impl Vcpu {
                     .unwrap_or_else(|err| {
                         self.response_sender
                             .send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
+                            .expect("vcpu channel unexpectedly closed");
+                    });
+
+                VcpuRunState::Paused
+            }
+            Ok(VcpuEvent::PreFaultMemory(ranges)) => {
+                pre_fault_memory(&self.kvm_vcpu.fd, &ranges)
+                    .map(|()| {
+                        self.response_sender
+                            .send(VcpuResponse::PreFaultMemoryCompleted)
+                            .expect("vcpu channel unexpectedly closed");
+                    })
+                    .unwrap_or_else(|err| {
+                        self.response_sender
+                            .send(VcpuResponse::Error(VcpuError::PreFaultMemory(err)))
                             .expect("vcpu channel unexpectedly closed");
                     });
 
@@ -542,6 +569,8 @@ pub enum VcpuEvent {
     SaveState,
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
+    /// Event to pre-fault selected memory of a paused Vcpu.
+    PreFaultMemory(Vec<PreFaultMemoryRange>),
 }
 
 /// List of responses that the Vcpu reports.
@@ -560,6 +589,8 @@ pub enum VcpuResponse {
     SavedState(Box<VcpuState>),
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
+    /// Requested memory pre-faulting completed.
+    PreFaultMemoryCompleted,
 }
 
 impl fmt::Debug for VcpuResponse {
@@ -573,6 +604,7 @@ impl fmt::Debug for VcpuResponse {
             Error(err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
+            PreFaultMemoryCompleted => write!(f, "VcpuResponse::PreFaultMemoryCompleted"),
         }
     }
 }
@@ -842,14 +874,19 @@ pub(crate) mod tests {
             // Guard match with no wildcard to make sure we catch new enum variants.
             match self {
                 Paused | Resumed | Exited(_) => (),
-                Error(_) | NotAllowed(_) | SavedState(_) | DumpedCpuConfig(_) => (),
+                Error(_)
+                | NotAllowed(_)
+                | SavedState(_)
+                | DumpedCpuConfig(_)
+                | PreFaultMemoryCompleted => (),
             };
             match (self, other) {
                 (Paused, Paused) | (Resumed, Resumed) => true,
                 (Exited(code), Exited(other_code)) => code == other_code,
                 (NotAllowed(_), NotAllowed(_))
                 | (SavedState(_), SavedState(_))
-                | (DumpedCpuConfig(_), DumpedCpuConfig(_)) => true,
+                | (DumpedCpuConfig(_), DumpedCpuConfig(_))
+                | (PreFaultMemoryCompleted, PreFaultMemoryCompleted) => true,
                 (Error(err), Error(other_err)) => {
                     format!("{:?}", err) == format!("{:?}", other_err)
                 }

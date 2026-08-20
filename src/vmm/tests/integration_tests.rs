@@ -8,7 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use kvm_bindings::KVM_CAP_PRE_FAULT_MEMORY;
+use kvm_ioctls::Kvm;
 use vmm::builder::build_and_boot_microvm;
+#[cfg(target_arch = "x86_64")]
+use vmm::builder::build_microvm_for_boot;
 use vmm::devices::virtio::block::CacheType;
 use vmm::persist::{
     GuestMemoryFromFileError, MicrovmState, MicrovmStateError, RestoreFromSnapshotError,
@@ -17,9 +21,12 @@ use vmm::persist::{
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
+    VmmData,
 };
 use vmm::seccomp::get_empty_filters;
 use vmm::snapshot::Snapshot;
+#[cfg(target_arch = "x86_64")]
+use vmm::test_utils::mock_resources::MockBootSourceConfig;
 use vmm::test_utils::mock_resources::{MockVmResources, NOISY_KERNEL_IMAGE};
 use vmm::test_utils::{create_vmm, default_vmm, default_vmm_no_boot};
 use vmm::vmm_config::balloon::BalloonDeviceConfig;
@@ -33,6 +40,9 @@ use vmm::vmm_config::snapshot::{
     SnapshotLoadHugePageConfig, SnapshotType,
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
+use vmm::vstate::prefault::PreFaultMemoryIoctlError;
+use vmm::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRange, PreFaultMemoryRequest};
+use vmm::vstate::vcpu::VcpuError;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
@@ -594,4 +604,257 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
     let req =
         VmmAction::UpdateMachineConfiguration(MachineConfigUpdate::from(MachineConfig::default()));
     verify_load_snap_disallowed_after_boot_resources(req, "SetVmConfiguration");
+}
+
+fn pre_fault_action(gpa: u64, size: u64) -> VmmAction {
+    VmmAction::PreFaultMemory(PreFaultMemoryRequest {
+        ranges: vec![PreFaultMemoryRange { gpa, size }],
+    })
+}
+
+fn assert_pre_fault_recovery(vmm: &Arc<Mutex<Vmm>>) {
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    controller.handle_request(VmmAction::Resume).unwrap();
+    controller.handle_request(VmmAction::Pause).unwrap();
+
+    let vm_info = {
+        let locked_vmm = vmm.lock().unwrap();
+        VmInfo::from(&*locked_vmm)
+    };
+    vmm.lock().unwrap().save_state(&vm_info).unwrap();
+}
+
+fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmActionError>) {
+    let capability = Kvm::new()
+        .expect("failed to open KVM while checking KVM_CAP_PRE_FAULT_MEMORY")
+        .check_extension_raw(u64::from(KVM_CAP_PRE_FAULT_MEMORY));
+
+    if capability > 0 {
+        let mode_unsupported = matches!(
+            &result,
+            Err(VmmActionError::PreFaultMemory(PreFaultMemoryError::Vcpu {
+                source: VcpuError::PreFaultMemory(PreFaultMemoryIoctlError::Ioctl {
+                    error,
+                    ..
+                }),
+                ..
+            })) if error.raw_os_error() == Some(libc::EOPNOTSUPP)
+        );
+        assert!(
+            matches!(&result, Ok(VmmData::Empty)) || mode_unsupported,
+            "KVM_CAP_PRE_FAULT_MEMORY={capability}, expected success or EOPNOTSUPP for the current vCPU mode, got {result:?}"
+        );
+    } else {
+        assert!(
+            matches!(
+                &result,
+                Err(VmmActionError::PreFaultMemory(
+                    PreFaultMemoryError::CapabilityMissing
+                ))
+            ),
+            "KVM_CAP_PRE_FAULT_MEMORY=0, expected CapabilityMissing, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_prefault_memory_state_validation_recovery_and_repeated_calls() {
+    use vmm::vstate::prefault::PreFaultMemoryValidationError;
+
+    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+    let mut controller = RuntimeApiController::new(vmm.clone());
+
+    controller.handle_request(VmmAction::Resume).unwrap();
+    let error = controller
+        .handle_request(pre_fault_action(0, 0x1000))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        VmmActionError::PreFaultMemory(PreFaultMemoryError::VmNotPaused(VmState::Running))
+    ));
+    controller.handle_request(VmmAction::Pause).unwrap();
+
+    let mut reject = |request, expected| {
+        let error = controller
+            .handle_request(VmmAction::PreFaultMemory(request))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            VmmActionError::PreFaultMemory(PreFaultMemoryError::Validation(actual))
+                if actual == expected
+        ));
+    };
+    reject(
+        PreFaultMemoryRequest { ranges: vec![] },
+        PreFaultMemoryValidationError::EmptyRanges,
+    );
+    reject(
+        PreFaultMemoryRequest {
+            ranges: vec![PreFaultMemoryRange {
+                gpa: 1,
+                size: 0x1000,
+            }],
+        },
+        PreFaultMemoryValidationError::Unaligned(0),
+    );
+    reject(
+        PreFaultMemoryRequest {
+            ranges: vec![PreFaultMemoryRange { gpa: 0, size: 0 }],
+        },
+        PreFaultMemoryValidationError::ZeroSize(0),
+    );
+    reject(
+        PreFaultMemoryRequest {
+            ranges: vec![PreFaultMemoryRange {
+                gpa: u64::MAX - 0xfff,
+                size: 0x2000,
+            }],
+        },
+        PreFaultMemoryValidationError::AddressOverflow(0),
+    );
+
+    let error = controller
+        .handle_request(pre_fault_action(0x2000_0000, 0x1000))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        VmmActionError::PreFaultMemory(PreFaultMemoryError::NotGuestRam(0))
+    ));
+
+    let first_result = controller.handle_request(pre_fault_action(0, 0x1000));
+    assert_pre_fault_supported_or_host_unsupported(first_result);
+    let second_result = controller.handle_request(pre_fault_action(0x1000, 0x1000));
+    assert_pre_fault_supported_or_host_unsupported(second_result);
+
+    // Rejected requests sent no work; verify that the VM remains usable. The repeated calls above
+    // also exercise response-channel reuse on capable x86_64 hosts.
+    assert_pre_fault_recovery(&vmm);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn multi_vcpu_vmm_no_boot() -> (Arc<Mutex<Vmm>>, EventManager) {
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let boot_source_cfg = MockBootSourceConfig::new()
+        .with_default_boot_args()
+        .with_kernel(NOISY_KERNEL_IMAGE);
+    let resources: VmResources = MockVmResources::new()
+        .with_boot_source(boot_source_cfg.into())
+        .with_vm_config(MachineConfig {
+            vcpu_count: 2,
+            ..Default::default()
+        })
+        .into();
+
+    let vmm = build_microvm_for_boot(
+        &InstanceInfo::default(),
+        &resources,
+        &mut event_manager,
+        &empty_seccomp_filters,
+    )
+    .unwrap();
+
+    (vmm, event_manager)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_prefault_memory_multi_vcpu_preserves_split_bytes_and_control_channel() {
+    use std::collections::HashSet;
+
+    use vmm::vstate::prefault::split_pre_fault_ranges;
+
+    let (vmm, _) = multi_vcpu_vmm_no_boot();
+    assert_eq!(vmm.lock().unwrap().machine_config.vcpu_count, 2);
+
+    let ranges = vec![
+        PreFaultMemoryRange {
+            gpa: 0,
+            size: 0x3000,
+        },
+        PreFaultMemoryRange {
+            gpa: 0x10_000,
+            size: 0x5000,
+        },
+    ];
+    let request = PreFaultMemoryRequest {
+        ranges: ranges.clone(),
+    };
+    let total_pages = request.validate().unwrap();
+    assert_eq!(total_pages, 8);
+
+    let work = split_pre_fault_ranges(&ranges, 2).unwrap();
+    assert_eq!(work.len(), 2);
+    assert_eq!(
+        work.iter().flatten().map(|range| range.size).sum::<u64>(),
+        total_pages * 0x1000
+    );
+
+    let expected_pages: HashSet<u64> = ranges
+        .iter()
+        .flat_map(|range| (0..range.size / 0x1000).map(move |page| range.gpa + page * 0x1000))
+        .collect();
+    let mut observed_pages = HashSet::new();
+    for fragment in work.iter().flatten() {
+        for page in 0..fragment.size / 0x1000 {
+            assert!(observed_pages.insert(fragment.gpa + page * 0x1000));
+        }
+    }
+    assert_eq!(observed_pages, expected_pages);
+
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let result = controller.handle_request(VmmAction::PreFaultMemory(request));
+    assert_pre_fault_supported_or_host_unsupported(result);
+
+    assert_pre_fault_recovery(&vmm);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn hotplug_vmm_no_boot(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+    // A no-boot (Paused) VMM with virtio-mem hotpluggable memory enabled, so its guest memory
+    // contains a Hotpluggable region alongside the DRAM region.
+    create_vmm(kernel_image, false, false, false, true)
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_prefault_memory_rejects_hotpluggable_region() {
+    use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+    use vmm::vstate::memory::GuestRegionType;
+
+    // Pre-fault must reject ranges that fall inside a Hotpluggable (virtio-mem) region even when the
+    // backing KVM slot exists: a single active virtio-mem block can mark the whole slot as plugged
+    // without every byte belonging to the guest. Resolve the hotpluggable region's start address
+    // dynamically so the test does not depend on the host allocator's layout.
+    let (vmm, _) = hotplug_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+    let mut controller = RuntimeApiController::new(vmm.clone());
+
+    let hotplug_start = {
+        let locked = vmm.lock().unwrap();
+        let guest_memory = locked.vm.guest_memory();
+        guest_memory
+            .iter()
+            .find(|region| region.region_type == GuestRegionType::Hotpluggable)
+            .map(|region| region.start_addr().0)
+            .expect("hotpluggable region must exist when memory hotplug is enabled")
+    };
+    assert_eq!(hotplug_start % 0x1000, 0);
+
+    let error = controller
+        .handle_request(pre_fault_action(hotplug_start, 0x1000))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            VmmActionError::PreFaultMemory(PreFaultMemoryError::NotGuestRam(0))
+        ),
+        "pre-fault into a hotpluggable region must be rejected with NotGuestRam(0), got {error:?}"
+    );
+
+    // The rejected request sent no work; the control channel must remain usable.
+    assert_pre_fault_recovery(&vmm);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
 }

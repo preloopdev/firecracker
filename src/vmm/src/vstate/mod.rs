@@ -9,6 +9,8 @@ pub mod interrupts;
 pub mod kvm;
 /// Module with GuestMemory implementation.
 pub mod memory;
+/// Selective guest-memory pre-faulting support.
+pub mod prefault;
 /// Resource manager for devices.
 pub mod resources;
 /// Module with Vcpu implementation.

@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod mmds;
 pub mod net;
 pub mod pmem;
+pub mod prefault;
 pub mod serial;
 pub mod snapshot;
 pub mod version;

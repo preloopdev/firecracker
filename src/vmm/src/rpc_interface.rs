@@ -34,7 +34,7 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
@@ -50,6 +50,7 @@ use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, Snap
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 use crate::vstate::memory::{DirtyMemoryRanges, GuestMemory};
+use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
 use crate::vstate::vm::VmError;
 
 /// This enum represents the public interface of the VMM. Each action contains various
@@ -80,6 +81,8 @@ pub enum VmmAction {
     GetDirtyMemoryRanges,
     /// Get guest memory region mappings. Post-boot only.
     GetGuestMemoryRegions,
+    /// Pre-fault selected guest memory. Paused VM only.
+    PreFaultMemory(PreFaultMemoryRequest),
     /// Get MMDS contents.
     GetMMDS,
     /// Get the machine configuration of the microVM.
@@ -177,6 +180,8 @@ pub enum VmmActionError {
     CreateSnapshot(#[from] CreateSnapshotError),
     /// Dirty memory ranges error: {0}
     DirtyMemoryRanges(#[from] VmError),
+    /// Pre-fault memory error: {0}
+    PreFaultMemory(#[from] PreFaultMemoryError),
     /// Configure CPU error: {0}
     ConfigureCpu(#[from] GuestConfigError),
     /// Drive config error: {0}
@@ -515,6 +520,9 @@ impl<'a> PrebootApiController<'a> {
             SetEntropyDevice(config) => self.set_entropy_device(config),
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
+            PreFaultMemory(_) => Err(VmmActionError::PreFaultMemory(
+                PreFaultMemoryError::VmNotPaused(VmState::NotStarted),
+            )),
             CreateSnapshot(_)
             | FlushMetrics
             | GetDirtyMemoryRanges
@@ -740,6 +748,7 @@ impl RuntimeApiController {
             )),
             GetDirtyMemoryRanges => self.get_dirty_memory_ranges(),
             GetGuestMemoryRegions => self.get_guest_memory_regions(),
+            PreFaultMemory(request) => self.pre_fault_memory(request),
             GetMemoryHotplugStatus => self
                 .vmm
                 .lock()
@@ -909,6 +918,18 @@ impl RuntimeApiController {
         info!("'resume vm' VMM action took {} us.", elapsed_time_us);
 
         Ok(VmmData::Empty)
+    }
+
+    fn pre_fault_memory(
+        &mut self,
+        request: PreFaultMemoryRequest,
+    ) -> Result<VmmData, VmmActionError> {
+        self.vmm
+            .lock()
+            .expect("Poisoned lock")
+            .pre_fault_memory(request)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::PreFaultMemory)
     }
 
     /// Write the metrics on user demand (flush). We use the word `flush` here to highlight the fact
@@ -1262,6 +1283,20 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::GetBalloonStats));
         check_unsupported(preboot_request(VmmAction::GetDirtyMemoryRanges));
         check_unsupported(preboot_request(VmmAction::GetGuestMemoryRegions));
+        let pre_fault_result = preboot_request(VmmAction::PreFaultMemory(
+            PreFaultMemoryRequest {
+                ranges: vec![crate::vstate::prefault::PreFaultMemoryRange {
+                    gpa: 0,
+                    size: 0x1000,
+                }],
+            },
+        ));
+        assert!(matches!(
+            pre_fault_result,
+            Err(VmmActionError::PreFaultMemory(
+                PreFaultMemoryError::VmNotPaused(VmState::NotStarted)
+            ))
+        ));
         check_unsupported(preboot_request(VmmAction::UpdateBalloon(
             BalloonUpdateConfig { amount_mib: 0 },
         )));
