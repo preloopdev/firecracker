@@ -758,6 +758,7 @@ pub mod tests {
         #[allow(deprecated)]
         verify_ok_response_with(VmmData::GuestMemoryRegions(vec![GuestRegionUffdMapping {
             base_host_virt_addr: 0x7f0000000000,
+            guest_phys_addr: 0,
             size: 0x10000000,
             offset: 0,
             page_size: 4096,

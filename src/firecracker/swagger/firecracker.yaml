@@ -1427,11 +1427,12 @@ definitions:
     type: object
     description:
       Describes a guest memory region mapping, providing the host virtual address,
-      region size, offset within a contiguous snapshot layout, and page size. Used
-      by external processes to read guest memory directly from the Firecracker
-      process address space via process_vm_readv().
+      guest physical address, region size, offset within a contiguous snapshot
+      layout, and page size. Used by external processes to read guest memory
+      directly from the Firecracker process address space via process_vm_readv().
     required:
       - base_host_virt_addr
+      - guest_phys_addr
       - size
       - offset
       - page_size
@@ -1440,6 +1441,13 @@ definitions:
         type: integer
         format: int64
         description: Base host virtual address of the guest memory region.
+      guest_phys_addr:
+        type: integer
+        format: int64
+        description:
+          Guest physical address at which this region begins. Unlike offset,
+          this preserves holes in the guest physical address space and is used
+          to translate a host virtual address in the region back to GPAs.
       size:
         type: integer
         format: int64

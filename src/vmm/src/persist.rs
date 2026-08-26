@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use vm_memory::{Address, GuestMemoryRegion};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -115,6 +116,12 @@ pub struct GuestRegionUffdMapping {
     /// Base host virtual address where the guest memory contents for this
     /// region should be copied/populated.
     pub base_host_virt_addr: u64,
+    /// Guest physical address at which this memory region begins.
+    ///
+    /// Unlike [`Self::offset`], this address preserves holes in the guest
+    /// physical address space and can therefore be used to translate a host
+    /// virtual address in this region back to a GPA.
+    pub guest_phys_addr: u64,
     /// Region size.
     pub size: usize,
     /// Offset in the backend file/buffer where the region contents are.
@@ -591,12 +598,12 @@ fn guest_memory_from_uffd(
 
 /// Builds a list of [`GuestRegionUffdMapping`]s from an iterator of memory regions.
 ///
-/// Each mapping records the host virtual address, region size, cumulative byte
-/// offset within a contiguous layout of all regions, and the page size from the
-/// given [`HugePageConfig`]. This is the single source of truth for constructing
-/// these mappings — used by both the uffd restore path and the runtime
-/// `GET /vm/guest-memory-regions` API.
-pub fn build_uffd_mappings<'a, R: Deref<Target = GuestMmapRegion> + 'a>(
+/// Each mapping records the host virtual address, guest physical address,
+/// region size, cumulative byte offset within a contiguous layout of all
+/// regions, and the page size from the given [`HugePageConfig`]. This is the
+/// single source of truth for constructing these mappings — used by both the
+/// uffd restore path and the runtime `GET /vm/guest-memory-regions` API.
+pub fn build_uffd_mappings<'a, R: Deref<Target = GuestMmapRegion> + GuestMemoryRegion + 'a>(
     regions: impl Iterator<Item = &'a R>,
     huge_pages: HugePageConfig,
 ) -> Vec<GuestRegionUffdMapping> {
@@ -606,6 +613,7 @@ pub fn build_uffd_mappings<'a, R: Deref<Target = GuestMmapRegion> + 'a>(
         #[allow(deprecated)]
         mappings.push(GuestRegionUffdMapping {
             base_host_virt_addr: mem_region.as_ptr() as u64,
+            guest_phys_addr: mem_region.start_addr().raw_value(),
             size: mem_region.size(),
             offset,
             page_size: huge_pages.page_size(),
@@ -833,6 +841,7 @@ mod tests {
         let uffd_regions = vec![
             GuestRegionUffdMapping {
                 base_host_virt_addr: 0,
+                guest_phys_addr: 0,
                 size: 0x100000,
                 offset: 0,
                 page_size: HugePageConfig::None.page_size(),
@@ -840,6 +849,7 @@ mod tests {
             },
             GuestRegionUffdMapping {
                 base_host_virt_addr: 0x100000,
+                guest_phys_addr: 0x200000,
                 size: 0x200000,
                 offset: 0,
                 page_size: HugePageConfig::Hugetlbfs2M.page_size(),
@@ -874,7 +884,12 @@ mod tests {
         use vm_memory::GuestAddress;
 
         let regions = memory::anonymous(
-            [(GuestAddress(0), 0x10000), (GuestAddress(0x10000), 0x20000)]
+            [
+                (GuestAddress(0), 0x10000),
+                // Model the x86 MMIO hole: snapshot offsets stay contiguous,
+                // while GPAs must retain the physical-address gap.
+                (GuestAddress(0x1_0000_0000), 0x20000),
+            ]
                 .iter()
                 .copied(),
             false,
@@ -888,12 +903,15 @@ mod tests {
 
         // First region: offset starts at 0.
         assert_ne!(mappings[0].base_host_virt_addr, 0);
+        assert_eq!(mappings[0].guest_phys_addr, 0);
         assert_eq!(mappings[0].size, 0x10000);
         assert_eq!(mappings[0].offset, 0);
         assert_eq!(mappings[0].page_size, 4096);
 
-        // Second region: offset is cumulative (== first region's size).
+        // The second region's image offset is cumulative, but its GPA preserves
+        // the physical-address gap rather than treating the image as contiguous.
         assert_ne!(mappings[1].base_host_virt_addr, 0);
+        assert_eq!(mappings[1].guest_phys_addr, 0x1_0000_0000);
         assert_eq!(mappings[1].size, 0x20000);
         assert_eq!(mappings[1].offset, 0x10000);
         assert_eq!(mappings[1].page_size, 4096);
