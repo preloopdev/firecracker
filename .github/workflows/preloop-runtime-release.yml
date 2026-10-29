@@ -1,15 +1,12 @@
-name: Preloop fork runtime build
+name: Preloop fork runtime release
 
 on:
   pull_request:
+    branches: [preloop/stable-v1.17.0]
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full committed source SHA to build (must descend from official release)
-        required: true
-        type: string
-      validation_evidence:
-        description: HTTPS URL of isolated cpane KVM and AgentENV lifecycle validation record
+        description: Full 40-character commit on preloop/runtime-v1.17.0 to build and package
         required: true
         type: string
 
@@ -17,99 +14,146 @@ permissions:
   contents: read
 
 concurrency:
-  group: preloop-runtime-${{ github.event.pull_request.number || github.run_id }}
+  group: preloop-runtime-release-${{ github.event.pull_request.number || inputs.source_sha || github.run_id }}
   cancel-in-progress: false
+
+env:
+  RUNTIME_VERSION: v1.17.0-preloop.1
+  SOURCE_BRANCH: preloop/runtime-v1.17.0
+  RUST_CHANNEL: 1.97.0
 
 jobs:
   build:
+    name: build ${{ matrix.arch }}
     if: github.repository == 'preloopdev/firecracker'
-    runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.identity.outputs.version }}
-      commit: ${{ steps.identity.outputs.commit }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_INCREMENTAL: '0'
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
       SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
-      VALIDATION_EVIDENCE: ${{ inputs.validation_evidence }}
+      CARGO_INCREMENTAL: '0'
     steps:
-      - name: Require a pinned source revision
+      - name: Require a full source commit
         run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check out the source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Install native musl build dependencies and pinned Rust
+      - name: Require the commit to be on the release branch
+        run: git merge-base --is-ancestor "$SOURCE_SHA" "origin/$SOURCE_BRANCH"
+      - name: Install the pinned toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools libclang-dev libudev-dev pkg-config
-          rustup toolchain install 1.97.0 --profile minimal --target x86_64-unknown-linux-musl
-      - name: Compile runtime and ported tests
+          sudo apt-get install -y musl-tools pkg-config libudev-dev
+          rustup toolchain install "$RUST_CHANNEL" --profile minimal --target "$TARGET"
+      - name: Fetch locked dependencies
+        run: cargo +"$RUST_CHANNEL" fetch --locked --target "$TARGET"
+      - name: Build release binaries from the locked tree
+        run: cargo +"$RUST_CHANNEL" build --frozen --release --workspace --bins --target "$TARGET"
+      - name: Record the builder toolchain
         run: |
-          cargo +1.97.0 build --locked --release --target x86_64-unknown-linux-musl -p firecracker -p jailer -p cpu-template-helper
-          cargo +1.97.0 test --locked --no-run --target x86_64-unknown-linux-musl -p vmm -p firecracker
-      - name: Record source identity
-        id: identity
+          {
+            rustc +"$RUST_CHANNEL" -Vv
+            cargo +"$RUST_CHANNEL" -V
+          } > "$RUNNER_TEMP/builder-toolchain.txt"
+      - name: Package this architecture
         run: |
-          python3 - <<'PY'
-          import json, os, subprocess
-          from pathlib import Path
-          contract = json.loads(Path('resources/preloop-runtime.json').read_text())
-          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          assert commit == os.environ['SOURCE_SHA']
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f"version={contract['runtime_version']}\ncommit={commit}\n")
-          PY
-      - name: Package provenance-bound draft release
+          python3 tools/preloop-release.py package \
+            --arch "$ARCH" \
+            --binary-dir "target/$TARGET/release" \
+            --builder-toolchain "$RUNNER_TEMP/builder-toolchain.txt" \
+            --source-commit "$SOURCE_SHA" \
+            --output-dir "$RUNNER_TEMP/out"
+      - name: Attest the archive and provenance
         if: github.event_name == 'workflow_dispatch'
-        run: |
-          python3 tools/preloop-release.py \
-            --binary-dir target/x86_64-unknown-linux-musl/release \
-            --output-dir "$RUNNER_TEMP/preloop-release" \
-            --validation-evidence "$VALIDATION_EVIDENCE"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: github.event_name == 'workflow_dispatch'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          name: preloop-fork-runtime
-          path: ${{ runner.temp }}/preloop-release/*
+          subject-path: ${{ runner.temp }}/out/*
+      - name: Upload the package for the index job
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
-  draft-release:
-    if: github.event_name == 'workflow_dispatch'
+  index:
+    name: index, attest, and create the prerelease
     needs: build
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'preloopdev/firecracker'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
       GH_TOKEN: ${{ github.token }}
-      GH_REPO: preloopdev/firecracker
-      SOURCE_SHA: ${{ needs.build.outputs.commit }}
-      RUNTIME_VERSION: ${{ needs.build.outputs.version }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Require a full source commit
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          name: preloop-fork-runtime
-          path: release
-      - name: Check downloaded artifact provenance
-        working-directory: release
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the commit to be on the release branch
+        run: git merge-base --is-ancestor "$SOURCE_SHA" "origin/$SOURCE_BRANCH"
+      - name: Download both architecture packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: runtime-*
+          path: ${{ runner.temp }}/in
+          merge-multiple: true
+      - name: Write the index and checksums
         run: |
-          sha256sum --check SHA256SUMS
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          data = json.loads(Path('provenance.json').read_text())
-          assert data['source_commit'] == os.environ['SOURCE_SHA']
-          assert data['source_tag'] == os.environ['RUNTIME_VERSION']
-          assert data['source_repository'] == 'preloopdev/firecracker'
-          PY
-      - name: Create draft only; never publish or deploy automatically
+          python3 tools/preloop-release.py index \
+            --input-dir "$RUNNER_TEMP/in" \
+            --source-commit "$SOURCE_SHA" \
+            --output-dir "$RUNNER_TEMP/release"
+      - name: Attest the index and checksums
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/provenance.json
+            ${{ runner.temp }}/release/SHA256SUMS
+      - name: Create the prerelease (not published)
         run: |
-          if tag_commit=$(gh api "repos/$GH_REPO/commits/$RUNTIME_VERSION" --jq .sha 2>/dev/null); then
-            [[ "$tag_commit" == "$SOURCE_SHA" ]]
-          fi
-          gh release create "$RUNTIME_VERSION" release/* \
-            --repo "$GH_REPO" --target "$SOURCE_SHA" --draft --prerelease \
-            --title "Preloop Firecracker $RUNTIME_VERSION" \
-            --notes "Fork runtime based on official v1.17.0, snapshot schema 13.0.0. Build provenance and checksums are attached. DRAFT: this CI build does not establish KVM, seccomp, old-runtime coexistence, or AgentENV lifecycle compatibility. Publish only after validating these exact artifact bytes on the isolated host and attaching the observed results. No automatic production deployment."
+          gh release create "$RUNTIME_VERSION" "$RUNNER_TEMP"/release/* \
+            --repo "$GH_REPO" --target "$SOURCE_SHA" --prerelease \
+            --title "Preloop Firecracker $RUNTIME_VERSION (prerelease, not validated)" \
+            --notes "Built by CI from $SOURCE_SHA. Lifecycle validation has not run. Not published."
+      - name: Record the prerelease identifiers
+        run: |
+          gh api "repos/$GH_REPO/releases/tags/$RUNTIME_VERSION" > "$RUNNER_TEMP/release.json"
+          tag_commit=$(gh api "repos/$GH_REPO/git/ref/tags/$RUNTIME_VERSION" --jq '.object.sha')
+          python3 tools/preloop-release.py pins \
+            --release-json "$RUNNER_TEMP/release.json" \
+            --release-dir "$RUNNER_TEMP/release" \
+            --tag-commit "$tag_commit" \
+            --source-commit "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/release-pins.json"
+          cat "$RUNNER_TEMP/release-pins.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the release identifiers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-pins
+          path: ${{ runner.temp }}/release-pins.json
+          if-no-files-found: error

@@ -532,6 +532,10 @@ impl Vmm {
                 return Err(PreFaultMemoryError::NotGuestRam(index));
             }
         }
+        // Pre-faulting is implemented only for x86_64; aarch64 is unsupported by design.
+        if !cfg!(target_arch = "x86_64") {
+            return Err(PreFaultMemoryError::ArchitectureUnsupported);
+        }
 
         if kvm_vm
             .kvm()

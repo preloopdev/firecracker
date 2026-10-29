@@ -11,64 +11,104 @@ Read more about the Firecracker Charter [here](CHARTER.md).
 
 ## Preloop fork runtime
 
-This fork ports the kvcache-ai runtime contract onto official v1.17.0
-(`95f868c8e345b1cc8faccd1a3c910b4989dc3f58`). Exact upstream and patch
-provenance is recorded in `resources/preloop-runtime.json`; the runtime key
-is `v1.17.0-preloop.1`.
+This fork ports the kvcache-ai runtime patch set onto official Firecracker
+v1.17.0 (`95f868c8e345b1cc8faccd1a3c910b4989dc3f58`). The release contract is
+`resources/preloop-runtime.json`; the runtime key is `v1.17.0-preloop.1`.
 
-The fork's snapshot format is **13.0.0** because block-device state now
-persists the `direct` flag in addition to upstream v1.17's format-12 state.
-This is not a compatibility promise. Keep v9 snapshots with their original
-fork runtime; do not relabel or blindly convert snapshot headers. Stock
-Firecracker binaries do not implement the fork API contract.
+The snapshot format is **13.0.0**. Upstream v1.17.0 writes 12.0.0, and the fork
+base writes 9.0.0. Neither is converted, and there is no compatibility promise:
+keep each snapshot with the runtime that wrote it.
 
-Build on an isolated Linux x86_64 host, not on a production runtime tree:
+KVM selective pre-fault (`PUT /vm/pre-fault-memory`) is **x86_64 only**. On
+aarch64 it returns `pre-fault memory is unsupported on this architecture`.
+Stock Firecracker binaries do not implement the fork API.
+
+### Release assets
+
+Each release has one archive per architecture in the contract:
+
++- `firecracker-v1.17.0-preloop.1-x86_64.tgz`
++- `firecracker-v1.17.0-preloop.1-aarch64.tgz`
+
+Each archive contains `firecracker`, `jailer`, `seccompiler-bin`, `rebase-snap`,
+`cpu-template-helper`, and `snapshot-editor` (each named `<name>-v1.17.0-preloop.1-<arch>`),
+plus the API spec, seccomp filter, CPU templates, licenses, and the release contract.
+`provenance-<arch>.json` records the archive digest, each binary's digest and rustc
+identity, the builder, and the patch-to-port map. `provenance.json` indexes both
+architectures, and `SHA256SUMS` covers every file. The index says whether the set is
+`complete`.
+
+Each provenance records one `build_origin`:
+
++- `github-actions`: `.github/workflows/preloop-runtime-release.yml` builds each
+  architecture on its native runner from a clean `source_sha` on
+  `preloop/runtime-v1.17.0` with `cargo --frozen`, packages it, and attests the
+  archive and provenance with `actions/attest-build-provenance`.
++- `local-build-record`: `tools/preloop-release.py package --build-record` packages a
+  builder's binaries after matching their digests to the record. It has no GitHub
+  attestation, so provisioning must not treat it as production.
+
+Local packaging (not production) needs a `git fetch origin preloop/runtime-v1.17.0`
+and a builder record with `schema_version` 3, `build_origin` `local-build-record`,
+`source_commit`, `arch`, `target`, `cargo_lock_sha256`, `rustc_verbose`,
+`builder_host`, `build_commands`, and `binary_sha256` for the six binaries:
+
+```sh
+python3 tools/preloop-release.py package --arch x86_64 \
+  --binary-dir /path/to/target/x86_64-unknown-linux-musl/release \
+  --source-commit <full sha> --build-record build-record-x86_64.json \
+  --output-dir /path/to/out-x86_64
+python3 tools/preloop-release.py index --input-dir /path/to/out-x86_64 \
+  --source-commit <full sha> --output-dir /path/to/index
+```
+
+Add `--allow-missing-architectures` to `index` only for an explicitly partial
+(`complete: false`) set, and never use a partial set as the default manifest.
+
+### Verify before use
+
+```sh
+gh attestation verify firecracker-v1.17.0-preloop.1-x86_64.tgz \
+  --repo preloopdev/firecracker \
+  --signer-workflow preloopdev/firecracker/.github/workflows/preloop-runtime-release.yml \
+  --source-digest <source_commit from provenance-x86_64.json>
+sha256sum --check SHA256SUMS
+```
+
+Then extract the archive and compare each `binary_sha256` in `provenance-<arch>.json`
+with the extracted binary. Attestations exist only for `github-actions` builds.
+
+### Release sequence
+
+1. The `index` job creates a **prerelease** (never published) and records its release,
+   tag, and asset IDs with SHA-256 values in `release-pins.json`.
+2. Isolated KVM and AgentENV lifecycle validation runs on the exact asset bytes.
+3. After validation passes, attach the evidence and publish:
+
+```sh
+gh release upload v1.17.0-preloop.1 validation-evidence.json --repo preloopdev/firecracker
+gh release edit v1.17.0-preloop.1 --repo preloopdev/firecracker --prerelease=false --latest
+```
+
+The build workflow takes no validation input and never publishes or deploys.
+
+### Validation scope
+
+Compiling is not runtime evidence. Before publishing, run the ported unit and
+integration tests and the KVM checks against the exact released binaries and default
+seccomp filters: dirty ranges preserve state; GPA holes differ from image offsets;
+state-only and full/diff snapshots restore; sync and async O_DIRECT handle aligned and
+unaligned buffers; memory and pmem sizes use seek; prefault validates, recovers its
+control channel, and (x86_64 only) behaves as specified. No aarch64 runtime validation
+exists yet.
+
+Local development build (not a release artifact):
 
 ```sh
 rustup toolchain install 1.97.0 --profile minimal --target x86_64-unknown-linux-musl
-CARGO_BUILD_JOBS=2 cargo +1.97.0 build --locked --release \
-  --target x86_64-unknown-linux-musl -p firecracker -p jailer -p cpu-template-helper
-CARGO_BUILD_JOBS=2 cargo +1.97.0 test --locked --no-run \
-  --target x86_64-unknown-linux-musl -p vmm -p firecracker
+cargo +1.97.0 fetch --locked --target x86_64-unknown-linux-musl
+cargo +1.97.0 build --frozen --release --workspace --bins --target x86_64-unknown-linux-musl
 ```
-
-Compilation alone is insufficient. Before publishing, run the ported Rust
-tests and the upstream integration suite on KVM with the **exact release
-binaries and default seccomp filters**. Validate dirty-range queries preserve
-dirty state, guest GPA holes differ from contiguous image offsets, state-only
-and full/diff snapshots restore correctly, sync/async O_DIRECT handles aligned
-and unaligned buffers and persists across restore/backing-file replacement,
-memory/pmem block-device sizes use seek, and prefault rejects invalid/running/
-hotplug ranges and recovers its control channel on supported and unsupported
-hosts. Then run AgentENV cold/warm boot, full/diff/UBLK snapshot restoration,
-stop/restart, concurrent old/new runtimes, and rollback to the old runtime.
-Old snapshots must remain assigned to their original runtime throughout.
-
-After recording those results, package the already-built artifacts from a
-clean committed source tree (the evidence URL records observations; the
-packager does not assert that a test passed):
-
-```sh
-python3 tools/preloop-release.py \
-  --binary-dir target/x86_64-unknown-linux-musl/release \
-  --output-dir /tmp/preloop-runtime-release \
-  --validation-evidence https://github.com/preloopdev/firecracker/pull/NUMBER
-```
-
-The archive contains Firecracker, jailer, cpu-template-helper, API schema,
-seccomp source and license files. `provenance.json` binds source commit,
-upstream/patch provenance, snapshot schema, actual packaging toolchain,
-archive SHA-256 and individual binary hashes. `SHA256SUMS` covers the archive
-and provenance. Validate the source tag resolves to `source_commit` and the
-GitHub asset digest agrees with these hashes before installing.
-
-The **Preloop fork runtime build** workflow compiles PRs; a manual run for a
-full source SHA builds and creates only a **draft** release on this fork.
-It never publishes or deploys. Workflow-built bytes must undergo the same
-isolated KVM/lifecycle checks before a maintainer publishes that draft.
-Release downloads use
-`https://github.com/preloopdev/firecracker/releases/download/v1.17.0-preloop.1/firecracker-v1.17.0-preloop.1-x86_64.tgz`;
-this is a release contract, not a statement that the artifact already exists.
 
 ## What is Firecracker?
 

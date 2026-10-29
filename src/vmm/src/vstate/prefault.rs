@@ -65,6 +65,8 @@ pub enum PreFaultMemoryError {
     VmNotPaused(VmState),
     /// pre-fault memory is unsupported: KVM_CAP_PRE_FAULT_MEMORY is unavailable
     CapabilityMissing,
+    /// pre-fault memory is unsupported on this architecture
+    ArchitectureUnsupported,
     /// pre-fault memory cannot run because no vCPU is available
     NoVcpus,
     /// failed to send pre-fault work to vCPU {vcpu_id}: {source}

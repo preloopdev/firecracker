@@ -1,25 +1,201 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "runtime_version": "v1.17.0-preloop.1",
   "source_repository": "preloopdev/firecracker",
+  "source_branch": "preloop/runtime-v1.17.0",
   "upstream_repository": "firecracker-microvm/firecracker",
   "upstream_tag": "v1.17.0",
   "upstream_commit": "95f868c8e345b1cc8faccd1a3c910b4989dc3f58",
   "patch_source_repository": "kvcache-ai/firecracker",
   "patch_source_commit": "9fbc98e4dc05d03e1f00902ba4bb796395465099",
   "patch_commits": [
-    "c3ec7aef79d09defa6b442e37d5179b848ab710b",
-    "caccb127bc7705a2423b048b0b0b00a6b401b8c9",
-    "d571a6501f03a08f9134ac1b8a72afe00c9c1f7c",
-    "8c42a29d0cfba03c4a30dc832330448de4855575",
-    "41385d4eaca425268ee8035620304160fe0ddc85",
-    "2a6598dc058b6e4275c8742669adb363cef01405",
-    "90288c397d6d3fa576f9d367d997bdeebf835f10",
-    "dcb1186cf03649783ffafc75fdeb93ffa3f21dbb",
-    "9fbc98e4dc05d03e1f00902ba4bb796395465099"
+    {
+      "commit": "c3ec7aef79d09defa6b442e37d5179b848ab710b",
+      "subject": "feat(pmem): use seek to get file size instead of fstat",
+      "patch_id": "7c078bc45b26723d5677fd481c0d5c52163e17bf",
+      "port_commit": "24f50fb5d73dbde42fabd428936a2b7e1ed0a195",
+      "status": "adapted",
+      "files": [
+        "src/vmm/src/devices/virtio/pmem/device.rs"
+      ]
+    },
+    {
+      "commit": "caccb127bc7705a2423b048b0b0b00a6b401b8c9",
+      "subject": "feat(snapshot): Set memfile path as optional while creating snapshot",
+      "patch_id": "508310bea7524a1d3e6fef4ffe07f067e255ea33",
+      "port_commit": "91717f16e03b82e0ab0da06b3fe931b4e26e0838",
+      "status": "adapted",
+      "files": [
+        "CLAUDE.md",
+        "src/firecracker/src/api_server/mod.rs",
+        "src/firecracker/src/api_server/request/snapshot.rs",
+        "src/firecracker/swagger/firecracker.yaml",
+        "src/vmm/src/persist.rs",
+        "src/vmm/src/rpc_interface.rs",
+        "src/vmm/src/vmm_config/snapshot.rs",
+        "src/vmm/tests/integration_tests.rs"
+      ]
+    },
+    {
+      "commit": "d571a6501f03a08f9134ac1b8a72afe00c9c1f7c",
+      "subject": "feat(virtio-blk): add direct option to open backing file as O_DIRECT",
+      "patch_id": "cb4ce72fc6667c899e91312ce3193ed12525b279",
+      "port_commit": "6e78e703bb3972ed30d0c396ce8d8813c58a638c",
+      "status": "adapted",
+      "files": [
+        "src/firecracker/swagger/firecracker.yaml",
+        "src/vmm/src/builder.rs",
+        "src/vmm/src/devices/virtio/block/vhost_user/device.rs",
+        "src/vmm/src/devices/virtio/block/virtio/device.rs",
+        "src/vmm/src/devices/virtio/block/virtio/io/async_io.rs",
+        "src/vmm/src/devices/virtio/block/virtio/io/mod.rs",
+        "src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs",
+        "src/vmm/src/devices/virtio/block/virtio/persist.rs",
+        "src/vmm/src/devices/virtio/block/virtio/test_utils.rs",
+        "src/vmm/src/resources.rs",
+        "src/vmm/src/rpc_interface.rs",
+        "src/vmm/src/vmm_config/drive.rs",
+        "src/vmm/tests/integration_tests.rs"
+      ]
+    },
+    {
+      "commit": "8c42a29d0cfba03c4a30dc832330448de4855575",
+      "subject": "feat(vmm): add an new rpc interface, to return guest memory regions",
+      "patch_id": "c9836c0a3838991838391295e13a6809c9401347",
+      "port_commit": "a0fa90502c47f1e93bba9e579fbb4137d10cc295",
+      "status": "adapted",
+      "files": [
+        "CLAUDE.md",
+        "src/firecracker/src/api_server/parsed_request.rs",
+        "src/firecracker/swagger/firecracker.yaml",
+        "src/vmm/src/persist.rs",
+        "src/vmm/src/rpc_interface.rs"
+      ]
+    },
+    {
+      "commit": "41385d4eaca425268ee8035620304160fe0ddc85",
+      "subject": "feat(snapshot): use seek to get memory image file size instead of fstat",
+      "patch_id": "d5b7e4857d3718d831f93ed66a4c42eb96abffc6",
+      "port_commit": "7ba21323fe74d719f91102d01ebb3610d4341417",
+      "status": "adapted",
+      "files": [
+        "src/vmm/src/vstate/memory.rs"
+      ]
+    },
+    {
+      "commit": "2a6598dc058b6e4275c8742669adb363cef01405",
+      "subject": "fix: rebase onto v1.15.1",
+      "patch_id": "3f479269ef1a12ca2ce3ddb4ed1cf4e913e9dbd7",
+      "port_commit": "aa65a92b6675b78db48bf8cf1c63d9f39d58164b",
+      "status": "adapted",
+      "files": [
+        "src/vmm/src/devices/virtio/block/virtio/io/async_io.rs",
+        "src/vmm/src/devices/virtio/block/virtio/io/mod.rs",
+        "src/vmm/src/devices/virtio/block/virtio/io/sync_io.rs",
+        "src/vmm/src/rpc_interface.rs",
+        "src/vmm/tests/integration_tests.rs"
+      ]
+    },
+    {
+      "commit": "90288c397d6d3fa576f9d367d997bdeebf835f10",
+      "subject": "feat: expose dirty memory ranges",
+      "patch_id": "924d18083507577df6bc0f0cace571053917e09f",
+      "port_commit": "d0b7dbf7d765c2c28a68adc9c02b9cc415d35e0e",
+      "status": "adapted",
+      "files": [
+        "CHANGELOG.md",
+        "Cargo.lock",
+        "src/cpu-template-helper/Cargo.toml",
+        "src/firecracker/Cargo.toml",
+        "src/firecracker/src/api_server/parsed_request.rs",
+        "src/firecracker/swagger/firecracker.yaml",
+        "src/jailer/Cargo.toml",
+        "src/rebase-snap/Cargo.toml",
+        "src/seccompiler/Cargo.toml",
+        "src/snapshot-editor/Cargo.toml",
+        "src/vmm/src/rpc_interface.rs",
+        "src/vmm/src/vstate/memory.rs",
+        "src/vmm/src/vstate/vm.rs"
+      ]
+    },
+    {
+      "commit": "dcb1186cf03649783ffafc75fdeb93ffa3f21dbb",
+      "subject": "feat: add KVM pre-fault memory API (#18)",
+      "patch_id": "d51bca00c6689ececfe6f4fb7bcc561a6cef321f",
+      "port_commit": "8aa49b7f71dc2846ede51b70a9b17de70da2239c",
+      "status": "adapted",
+      "files": [
+        "CHANGELOG.md",
+        "resources/seccomp/aarch64-unknown-linux-musl.json",
+        "resources/seccomp/x86_64-unknown-linux-musl.json",
+        "src/firecracker/src/api_server/parsed_request.rs",
+        "src/firecracker/src/api_server/request/mod.rs",
+        "src/firecracker/src/api_server/request/prefault.rs",
+        "src/firecracker/swagger/firecracker.yaml",
+        "src/vmm/src/lib.rs",
+        "src/vmm/src/rpc_interface.rs",
+        "src/vmm/src/vstate/mod.rs",
+        "src/vmm/src/vstate/prefault.rs",
+        "src/vmm/src/vstate/vcpu.rs",
+        "src/vmm/tests/integration_tests.rs"
+      ]
+    },
+    {
+      "commit": "9fbc98e4dc05d03e1f00902ba4bb796395465099",
+      "subject": "release: prepare v1.15.1-patch-v2 (#20)",
+      "patch_id": "c83700b0c7ac392312a10d7777bd4a5a7d99c8c2",
+      "port_commit": "c19a7b2559e02e60bafe1f9fe04f58312006164f",
+      "status": "adapted",
+      "files": [
+        "CHANGELOG.md",
+        "Cargo.lock",
+        "src/cpu-template-helper/Cargo.toml",
+        "src/firecracker/Cargo.toml",
+        "src/firecracker/src/api_server/parsed_request.rs",
+        "src/firecracker/swagger/firecracker.yaml",
+        "src/jailer/Cargo.toml",
+        "src/rebase-snap/Cargo.toml",
+        "src/seccompiler/Cargo.toml",
+        "src/snapshot-editor/Cargo.toml",
+        "src/vmm/src/persist.rs"
+      ]
+    }
   ],
   "snapshot_version": "13.0.0",
-  "target": "x86_64-unknown-linux-musl",
+  "architectures": {
+    "x86_64": {
+      "target": "x86_64-unknown-linux-musl",
+      "elf_machine": 62,
+      "seccomp": "resources/seccomp/x86_64-unknown-linux-musl.json"
+    },
+    "aarch64": {
+      "target": "aarch64-unknown-linux-musl",
+      "elf_machine": 183,
+      "seccomp": "resources/seccomp/aarch64-unknown-linux-musl.json"
+    }
+  },
+  "binaries": [
+    "firecracker",
+    "jailer",
+    "seccompiler-bin",
+    "rebase-snap",
+    "cpu-template-helper",
+    "snapshot-editor"
+  ],
+  "cpu_templates": [
+    "C3",
+    "T2",
+    "T2S",
+    "T2CL",
+    "T2A",
+    "V1N1"
+  ],
+  "release_inputs": [
+    "LICENSE",
+    "NOTICE",
+    "THIRD-PARTY",
+    "src/firecracker/swagger/firecracker.yaml"
+  ],
   "required_features": [
     "dirty-memory-ranges-preserve",
     "guest-memory-regions-gpa",
@@ -28,5 +204,11 @@
     "seek-memory-image-size",
     "seek-pmem-size",
     "kvm-prefault-memory"
-  ]
+  ],
+  "feature_support": {
+    "kvm-prefault-memory": {
+      "x86_64": "supported",
+      "aarch64": "unsupported"
+    }
+  }
 }

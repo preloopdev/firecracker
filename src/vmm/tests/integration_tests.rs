@@ -626,6 +626,18 @@ fn assert_pre_fault_recovery(vmm: &Arc<Mutex<Vmm>>) {
 }
 
 fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmActionError>) {
+    if !cfg!(target_arch = "x86_64") {
+        assert!(
+            matches!(
+                &result,
+                Err(VmmActionError::PreFaultMemory(
+                    PreFaultMemoryError::ArchitectureUnsupported
+                ))
+            ),
+            "pre-fault memory must be unsupported on this architecture, got {result:?}"
+        );
+        return;
+    }
     let capability = Kvm::new()
         .expect("failed to open KVM while checking KVM_CAP_PRE_FAULT_MEMORY")
         .check_extension_raw(u64::from(KVM_CAP_PRE_FAULT_MEMORY));
