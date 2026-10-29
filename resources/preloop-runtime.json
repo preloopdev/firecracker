@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "runtime_version": "v1.17.0-preloop.1",
   "source_repository": "preloopdev/firecracker",
   "source_branch": "preloop/runtime-v1.17.0",
@@ -177,11 +177,18 @@
   "binaries": [
     "firecracker",
     "jailer",
-    "seccompiler-bin",
-    "rebase-snap",
-    "cpu-template-helper",
-    "snapshot-editor"
+    "cpu-template-helper"
   ],
+  "build_packages": [
+    "firecracker",
+    "jailer",
+    "cpu-template-helper"
+  ],
+  "omitted_binaries": {
+    "seccompiler-bin": "development tool, not part of the runtime release set; a musl build failed to link against the glibc libseccomp.a present in the build environment (undefined __memset_chk and __fprintf_chk)",
+    "rebase-snap": "development tool, not part of the runtime release set; its musl build was not verified for this release",
+    "snapshot-editor": "development tool, not part of the runtime release set; its musl build was not verified for this release"
+  },
   "cpu_templates": [
     "C3",
     "T2",

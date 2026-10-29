@@ -13,7 +13,7 @@ Read more about the Firecracker Charter [here](CHARTER.md).
 
 This fork ports the kvcache-ai runtime patch set onto official Firecracker
 v1.17.0 (`95f868c8e345b1cc8faccd1a3c910b4989dc3f58`). The release contract is
-`resources/preloop-runtime.json`; the runtime key is `v1.17.0-preloop.1`.
+`resources/preloop-runtime.json` (schema 4); the runtime key is `v1.17.0-preloop.1`.
 
 The snapshot format is **13.0.0**. Upstream v1.17.0 writes 12.0.0, and the fork
 base writes 9.0.0. Neither is converted, and there is no compatibility promise:
@@ -27,43 +27,79 @@ Stock Firecracker binaries do not implement the fork API.
 
 Each release has one archive per architecture in the contract:
 
-+- `firecracker-v1.17.0-preloop.1-x86_64.tgz`
-+- `firecracker-v1.17.0-preloop.1-aarch64.tgz`
+- `firecracker-v1.17.0-preloop.1-x86_64.tgz`
+- `firecracker-v1.17.0-preloop.1-aarch64.tgz`
 
-Each archive contains `firecracker`, `jailer`, `seccompiler-bin`, `rebase-snap`,
-`cpu-template-helper`, and `snapshot-editor` (each named `<name>-v1.17.0-preloop.1-<arch>`),
-plus the API spec, seccomp filter, CPU templates, licenses, and the release contract.
-`provenance-<arch>.json` records the archive digest, each binary's digest and rustc
-identity, the builder, and the patch-to-port map. `provenance.json` indexes both
-architectures, and `SHA256SUMS` covers every file. The index says whether the set is
-`complete`.
+Each archive contains `firecracker`, `jailer`, and `cpu-template-helper`, each named
+`<name>-v1.17.0-preloop.1-<arch>`, plus the API spec, seccomp filter, CPU templates,
+licenses, and the release contract. The release set omits `seccompiler-bin`,
+`rebase-snap`, and `snapshot-editor`: they are development tools, and a musl
+`seccompiler-bin` build failed to link against the glibc `libseccomp.a` in the build
+environment. The contract's `omitted_binaries` records each omission, and every
+provenance and index repeats it.
+
+`provenance-<arch>.json` records the archive digest, each shipped binary's digest and
+rustc identity, the builder, the build packages, and the patch-to-port map.
+`provenance.json` indexes both architectures, and `SHA256SUMS` covers every file. The
+index says whether the set is `complete`.
 
 Each provenance records one `build_origin`:
 
-+- `github-actions`: `.github/workflows/preloop-runtime-release.yml` builds each
+- `github-actions`: `.github/workflows/preloop-runtime-release.yml` builds each
   architecture on its native runner from a clean `source_sha` on
   `preloop/runtime-v1.17.0` with `cargo --frozen`, packages it, and attests the
   archive and provenance with `actions/attest-build-provenance`.
-+- `local-build-record`: `tools/preloop-release.py package --build-record` packages a
+- `local-build-record`: `tools/preloop-release.py package --build-record` packages a
   builder's binaries after matching their digests to the record. It has no GitHub
   attestation, so provisioning must not treat it as production.
 
-Local packaging (not production) needs a `git fetch origin preloop/runtime-v1.17.0`
-and a builder record with `schema_version` 3, `build_origin` `local-build-record`,
-`source_commit`, `arch`, `target`, `cargo_lock_sha256`, `rustc_verbose`,
-`builder_host`, `build_commands`, and `binary_sha256` for the six binaries:
+Local packaging requires `git fetch origin preloop/runtime-v1.17.0`, a clean tree outside
+`target/`, and a builder record with `schema_version` 4, `build_origin`
+`local-build-record`, `source_commit`, `arch`, `target`, `cargo_lock_sha256`,
+`rustc_verbose` (the full `rustc +1.97.0 -Vv` output), `builder_host`, `build_commands`
+(must include a `--frozen --release` build of every package for the target), and
+`binary_sha256` for each shipped binary:
 
 ```sh
 python3 tools/preloop-release.py package --arch x86_64 \
-  --binary-dir /path/to/target/x86_64-unknown-linux-musl/release \
+  --binary-dir target/x86_64-unknown-linux-musl/release \
   --source-commit <full sha> --build-record build-record-x86_64.json \
-  --output-dir /path/to/out-x86_64
-python3 tools/preloop-release.py index --input-dir /path/to/out-x86_64 \
-  --source-commit <full sha> --output-dir /path/to/index
+  --output-dir out/x86_64
+mkdir -p out/in && cp out/x86_64/* out/in/   # add out/aarch64/* once it exists
+python3 tools/preloop-release.py index --input-dir out/in \
+  --source-commit <full sha> --output-dir out/index
 ```
 
 Add `--allow-missing-architectures` to `index` only for an explicitly partial
 (`complete: false`) set, and never use a partial set as the default manifest.
+
+### Build commands
+
+x86_64 (native on Linux x86_64):
+
+```sh
+rustup toolchain install 1.97.0 --profile minimal --target x86_64-unknown-linux-musl
+cargo +1.97.0 fetch --locked --target x86_64-unknown-linux-musl
+CARGO_BUILD_JOBS=2 cargo +1.97.0 build --frozen --release --target x86_64-unknown-linux-musl \
+  -p firecracker -p jailer -p cpu-template-helper
+```
+
+aarch64 (cross from x86_64 Linux; substitute the musl cross compiler you have installed):
+
+```sh
+AARCH64_MUSL_CC=/path/to/aarch64-linux-musl-gcc
+AARCH64_MUSL_AR=/path/to/aarch64-linux-musl-ar
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$AARCH64_MUSL_CC"
+export CC_aarch64_unknown_linux_musl="$AARCH64_MUSL_CC"
+export AR_aarch64_unknown_linux_musl="$AARCH64_MUSL_AR"
+rustup toolchain install 1.97.0 --profile minimal --target aarch64-unknown-linux-musl
+cargo +1.97.0 fetch --locked --target aarch64-unknown-linux-musl
+CARGO_BUILD_JOBS=2 cargo +1.97.0 build --frozen --release --target aarch64-unknown-linux-musl \
+  -p firecracker -p jailer -p cpu-template-helper
+```
+
+The aarch64 cross link has not been verified by any run. Treat it as a build risk until
+the link succeeds and the packager's ELF checks pass.
 
 ### Verify before use
 
@@ -101,14 +137,6 @@ state-only and full/diff snapshots restore; sync and async O_DIRECT handle align
 unaligned buffers; memory and pmem sizes use seek; prefault validates, recovers its
 control channel, and (x86_64 only) behaves as specified. No aarch64 runtime validation
 exists yet.
-
-Local development build (not a release artifact):
-
-```sh
-rustup toolchain install 1.97.0 --profile minimal --target x86_64-unknown-linux-musl
-cargo +1.97.0 fetch --locked --target x86_64-unknown-linux-musl
-cargo +1.97.0 build --frozen --release --workspace --bins --target x86_64-unknown-linux-musl
-```
 
 ## What is Firecracker?
 

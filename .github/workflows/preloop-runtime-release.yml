@@ -62,8 +62,10 @@ jobs:
           rustup toolchain install "$RUST_CHANNEL" --profile minimal --target "$TARGET"
       - name: Fetch locked dependencies
         run: cargo +"$RUST_CHANNEL" fetch --locked --target "$TARGET"
-      - name: Build release binaries from the locked tree
-        run: cargo +"$RUST_CHANNEL" build --frozen --release --workspace --bins --target "$TARGET"
+      - name: Build the shipped runtime packages from the locked tree
+        run: |
+          packages=$(python3 -c 'import json; print(" ".join("-p " + p for p in json.load(open("resources/preloop-runtime.json"))["build_packages"]))')
+          cargo +"$RUST_CHANNEL" build --frozen --release --target "$TARGET" $packages
       - name: Record the builder toolchain
         run: |
           {

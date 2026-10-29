@@ -11,8 +11,10 @@ the checkout.
       Inside GitHub Actions only. DIR must be target/<target>/release of this checkout,
       built by the same job. Each binary must run natively to report its version.
   package --arch ARCH --binary-dir DIR --source-commit SHA --build-record FILE --output-dir DIR
-      Outside Actions only. FILE is the builder's record; its binary digests must match
-      DIR exactly. The output is marked local-build-record and has no GitHub attestation.
+      Outside Actions only. FILE is the builder's record. Its binary digests must match
+      DIR exactly, and its build commands must include a --frozen --release build of the
+      contract's packages for the architecture's target. The output is marked
+      local-build-record and has no GitHub attestation.
   index --input-dir DIR --source-commit SHA [--allow-missing-architectures] --output-dir DIR
       Cross-checks each architecture's archive against its provenance, then writes
       provenance.json and SHA256SUMS.
@@ -42,7 +44,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "resources" / "preloop-runtime.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CHECKSUMS = "SHA256SUMS"
 BUILD_ORIGIN_ACTIONS = "github-actions"
 BUILD_ORIGIN_RECORD = "local-build-record"
@@ -125,6 +127,11 @@ def load_contract() -> dict:
             fail(f"{arch} must build for {arch}-unknown-linux-musl")
         if not (ROOT / spec["seccomp"]).is_file():
             fail(f"missing seccomp filter {spec['seccomp']}")
+    if sorted(contract["build_packages"]) != sorted(contract["binaries"]):
+        fail("build_packages must name exactly the shipped binaries")
+    for name, reason in contract["omitted_binaries"].items():
+        if name in contract["binaries"] or not reason.strip():
+            fail(f"omitted binary {name} must not be shipped and must state a reason")
     version = contract["runtime_version"]
     cargo_version = tomllib.loads((ROOT / "src/firecracker/Cargo.toml").read_text())["package"]["version"]
     if version != f"v{cargo_version}":
@@ -251,7 +258,8 @@ def check_version(path: Path, arch: str, version: str, native_required: bool) ->
     return {"method": "embedded-version-string", "executed": False}
 
 
-def actions_builder(channel: str, toolchain_text: str, target: str) -> dict:
+def actions_builder(channel: str, toolchain_text: str, target: str, packages: list[str]) -> dict:
+    package_flags = " ".join(f"-p {package}" for package in packages)
     return {
         "repository": require_env("GITHUB_REPOSITORY"),
         "workflow_ref": require_env("GITHUB_WORKFLOW_REF"),
@@ -266,7 +274,7 @@ def actions_builder(channel: str, toolchain_text: str, target: str) -> dict:
         "rustc_verbose": toolchain_text,
         "build_commands": [
             f"cargo +{channel} fetch --locked --target {target}",
-            f"cargo +{channel} build --frozen --release --workspace --bins --target {target}",
+            f"cargo +{channel} build --frozen --release --target {target} {package_flags}",
         ],
         "cargo_lock_sha256": sha256_file(ROOT / "Cargo.lock"),
     }
@@ -291,9 +299,19 @@ def verify_build_record(
     for key in ("builder_host", "build_commands"):
         if not record.get(key):
             fail(f"build record lacks {key}")
+    builds = [command for command in record["build_commands"] if " build " in f" {command} "]
+    required = [f"-p {package}" for package in contract["build_packages"]]
+    if not any(
+        "--frozen" in command
+        and "--release" in command
+        and spec["target"] in command
+        and all(flag in command for flag in required)
+        for command in builds
+    ):
+        fail("the build record must show a --frozen --release build of the contract's packages for the target")
     digests = record.get("binary_sha256", {})
     if sorted(digests) != sorted(contract["binaries"]):
-        fail("the build record must list exactly the contract's binaries")
+        fail("the build record must list exactly the contract's shipped binaries")
     builder = {
         "host": record["builder_host"],
         "rust_channel": channel,
@@ -398,11 +416,15 @@ def verify_record(
     for key, value in expected.items():
         if record.get(key) != value:
             fail(f"{arch}: provenance {key} is {record.get(key)!r}; expected {value!r}")
+    if record.get("build_packages") != contract["build_packages"]:
+        fail(f"{arch}: provenance build_packages differ from the contract")
+    if record.get("omitted_binaries") != contract["omitted_binaries"]:
+        fail(f"{arch}: provenance omitted_binaries differ from the contract")
     if record.get("builder", {}).get("rust_channel") != channel:
         fail(f"{arch}: the builder did not use the pinned Rust {channel}")
     binaries = record.get("binaries", {})
     if sorted(binaries) != sorted(contract["binaries"]):
-        fail(f"{arch}: provenance must list exactly the contract's binaries")
+        fail(f"{arch}: provenance must list exactly the contract's shipped binaries")
     for name, info in binaries.items():
         if info.get("file") != f"{name}-{version}-{arch}":
             fail(f"{arch}: {name} is recorded under an unexpected file name")
@@ -450,7 +472,7 @@ def cmd_package(args: argparse.Namespace) -> None:
         toolchain_text = args.builder_toolchain.read_text()
         require_release(toolchain_text, channel, "the builder toolchain record")
         origin = BUILD_ORIGIN_ACTIONS
-        builder = actions_builder(channel, toolchain_text, spec["target"])
+        builder = actions_builder(channel, toolchain_text, spec["target"], contract["build_packages"])
         expected_digests = None
         native_required = True
     else:
@@ -512,6 +534,8 @@ def cmd_package(args: argparse.Namespace) -> None:
             "patch_source_repository": contract["patch_source_repository"],
             "patch_source_commit": contract["patch_source_commit"],
             "patch_commits": contract["patch_commits"],
+            "build_packages": contract["build_packages"],
+            "omitted_binaries": contract["omitted_binaries"],
             "snapshot_version": contract["snapshot_version"],
             "required_features": contract["required_features"],
             "feature_support": contract["feature_support"],
@@ -597,6 +621,8 @@ def cmd_index(args: argparse.Namespace) -> None:
         "upstream_commit": contract["upstream_commit"],
         "patch_source_repository": contract["patch_source_repository"],
         "patch_source_commit": contract["patch_source_commit"],
+        "build_packages": contract["build_packages"],
+        "omitted_binaries": contract["omitted_binaries"],
         "snapshot_version": contract["snapshot_version"],
         "contract_sha256": sha256_file(CONTRACT_PATH),
         "checksums": CHECKSUMS,
