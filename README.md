@@ -23,6 +23,11 @@ KVM selective pre-fault (`PUT /vm/pre-fault-memory`) is **x86_64 only**. On
 aarch64 it returns `pre-fault memory is unsupported on this architecture`.
 Stock Firecracker binaries do not implement the fork API.
 
+Branches: `preloop/runtime-v1.17.0` is this fork's default branch and the release line.
+The release workflow exists only there, so `workflow_dispatch` can see it.
+`preloop/stable-v1.17.0` remains the upstream v1.17.0 base (the pull request base);
+it does not contain the release workflow.
+
 ### Release assets
 
 Each release has one archive per architecture in the contract:
@@ -41,7 +46,9 @@ provenance and index repeats it.
 `provenance-<arch>.json` records the archive digest, each shipped binary's digest and
 rustc identity, the builder, the build packages, and the patch-to-port map.
 `provenance.json` indexes both architectures, and `SHA256SUMS` covers every file. The
-index says whether the set is `complete`.
+index says whether the set is `complete`. `release-pins.json` is attached to the
+prerelease after it is created, so it is not in `SHA256SUMS`. It lists the release and
+asset IDs, sizes, and digests that the lifecycle gate pins.
 
 Each provenance records one `build_origin`:
 
@@ -116,9 +123,12 @@ with the extracted binary. Attestations exist only for `github-actions` builds.
 
 ### Release sequence
 
-1. The `index` job creates a **prerelease** (never published) and records its release,
-   tag, and asset IDs with SHA-256 values in `release-pins.json`.
-2. Isolated KVM and AgentENV lifecycle validation runs on the exact asset bytes.
+1. The `index` job creates a **prerelease** (never published), attests the index and
+   checksums, writes `release-pins.json` (release, tag, and asset IDs with sizes and
+   SHA-256 values; it excludes itself), and attaches that file to the prerelease as a
+   release asset.
+2. Isolated KVM and AgentENV lifecycle validation runs on the exact asset bytes, using
+   the pinned asset IDs and digests.
 3. After validation passes, attach the evidence and publish:
 
 ```sh
@@ -127,6 +137,20 @@ gh release edit v1.17.0-preloop.1 --repo preloopdev/firecracker --prerelease=fal
 ```
 
 The build workflow takes no validation input and never publishes or deploys.
+
+Dispatch the workflow from the default branch. The dispatch ref's head must be the source
+commit, because the workflow refuses to run unless `GITHUB_SHA` equals `source_sha`:
+
+```sh
+gh workflow run preloop-runtime-release.yml --repo preloopdev/firecracker \
+  --ref preloop/runtime-v1.17.0 -f source_sha=<full sha of the preloop/runtime-v1.17.0 head>
+```
+
+When GitHub Actions is unavailable, run `index` locally, create the prerelease from the
+index output directory with `gh release create ... --prerelease --target <sha>`, fetch its
+JSON with `gh api repos/preloopdev/firecracker/releases/tags/v1.17.0-preloop.1`, run
+`pins` on that JSON, and attach `release-pins.json` with `gh release upload`. A locally
+generated pins file records `generated_in_actions: false`.
 
 ### Validation scope
 

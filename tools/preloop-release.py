@@ -19,7 +19,9 @@ the checkout.
       Cross-checks each architecture's archive against its provenance, then writes
       provenance.json and SHA256SUMS.
   pins --release-json FILE --release-dir DIR --tag-commit SHA --source-commit SHA --output FILE
-      Inside Actions only. Records the prerelease, tag, and asset identifiers.
+      Records the prerelease, tag, and asset identifiers for every asset except
+      release-pins.json. Inside Actions it records generated_in_actions true; outside it
+      requires the release URL for this repository and records false.
 
 Nothing here builds, publishes, or deploys, and nothing here records a test result.
 """
@@ -635,23 +637,27 @@ def cmd_index(args: argparse.Namespace) -> None:
 
 
 def cmd_pins(args: argparse.Namespace) -> None:
-    if not in_actions():
-        fail("pins runs only inside GitHub Actions")
     contract = load_contract()
-    require_repository(contract)
     version = contract["runtime_version"]
     head = check_source(contract, args.source_commit)
+    in_ci = in_actions()
+    if in_ci:
+        require_repository(contract)
     if args.tag_commit != head:
         fail(f"the tag points to {args.tag_commit}, not the source commit {head}")
     release = json.loads(args.release_json.read_text())
+    expected_url = f"https://github.com/{contract['source_repository']}/releases/tag/{version}"
     if release.get("tag_name") != version or release.get("draft") or not release.get("prerelease"):
         fail("the release must be a prerelease for the runtime tag")
-    local = {path.name: path for path in args.release_dir.iterdir() if path.is_file()}
-    remote_names = sorted(asset["name"] for asset in release.get("assets", []))
-    if remote_names != sorted(local):
+    if release.get("html_url") != expected_url:
+        fail(f"the release URL is {release.get('html_url')!r}; expected {expected_url}")
+    pins_asset = "release-pins.json"
+    remote = [asset for asset in release.get("assets", []) if asset["name"] != pins_asset]
+    local = {path.name: path for path in args.release_dir.iterdir() if path.is_file() and path.name != pins_asset}
+    if sorted(asset["name"] for asset in remote) != sorted(local):
         fail("release assets do not match the packaged files")
     assets = []
-    for asset in release["assets"]:
+    for asset in remote:
         path = local[asset["name"]]
         if asset["size"] != path.stat().st_size:
             fail(f"size mismatch for {asset['name']}")
@@ -670,10 +676,11 @@ def cmd_pins(args: argparse.Namespace) -> None:
         "tag_commit": head,
         "release_id": release["id"],
         "prerelease": True,
+        "generated_in_actions": in_ci,
         "assets": sorted(assets, key=lambda item: item["name"]),
     }
     args.output.write_text(json.dumps(pins, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"release_id": release["id"], "assets": len(assets)}, indent=2))
+    print(json.dumps({"release_id": release["id"], "assets": len(assets), "generated_in_actions": in_ci}, indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:

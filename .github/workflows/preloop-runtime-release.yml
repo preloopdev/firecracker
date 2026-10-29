@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-character commit on preloop/runtime-v1.17.0 to build and package
+        description: Full 40-character commit that is also the head of preloop/runtime-v1.17.0 at dispatch
         required: true
         type: string
 
@@ -47,6 +47,13 @@ jobs:
     steps:
       - name: Require a full source commit
         run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Require the run to be built from the source commit
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "$GITHUB_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::GITHUB_SHA $GITHUB_SHA is not SOURCE_SHA $SOURCE_SHA; dispatch from a ref whose head is the source commit." >&2
+            exit 1
+          fi
       - name: Check out the source commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -110,6 +117,12 @@ jobs:
     steps:
       - name: Require a full source commit
         run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Require the run to be built from the source commit
+        run: |
+          if [[ "$GITHUB_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::GITHUB_SHA $GITHUB_SHA is not SOURCE_SHA $SOURCE_SHA; dispatch from a ref whose head is the source commit." >&2
+            exit 1
+          fi
       - name: Check out the source commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -153,9 +166,5 @@ jobs:
             --source-commit "$SOURCE_SHA" \
             --output "$RUNNER_TEMP/release-pins.json"
           cat "$RUNNER_TEMP/release-pins.json" >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload the release identifiers
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-pins
-          path: ${{ runner.temp }}/release-pins.json
-          if-no-files-found: error
+      - name: Attach release-pins.json to the prerelease
+        run: gh release upload "$RUNTIME_VERSION" "$RUNNER_TEMP/release-pins.json" --repo "$GH_REPO"
