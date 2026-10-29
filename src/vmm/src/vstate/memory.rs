@@ -1870,7 +1870,7 @@ mod tests {
 
     #[test]
     fn test_dirty_memory_ranges() {
-        let page_size = get_page_size().unwrap();
+        let page_size = host_page_size();
 
         // Two regions of four pages each, with a one page GPA gap between them.
         let region_1_address = GuestAddress(0);

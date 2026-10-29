@@ -1,0 +1,115 @@
+name: Preloop fork runtime build
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full committed source SHA to build (must descend from official release)
+        required: true
+        type: string
+      validation_evidence:
+        description: HTTPS URL of isolated cpane KVM and AgentENV lifecycle validation record
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preloop-runtime-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'preloopdev/firecracker'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      commit: ${{ steps.identity.outputs.commit }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
+      VALIDATION_EVIDENCE: ${{ inputs.validation_evidence }}
+    steps:
+      - name: Require a pinned source revision
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install native musl build dependencies and pinned Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools libclang-dev libudev-dev pkg-config
+          rustup toolchain install 1.97.0 --profile minimal --target x86_64-unknown-linux-musl
+      - name: Compile runtime and ported tests
+        run: |
+          cargo +1.97.0 build --locked --release --target x86_64-unknown-linux-musl -p firecracker -p jailer -p cpu-template-helper
+          cargo +1.97.0 test --locked --no-run --target x86_64-unknown-linux-musl -p vmm -p firecracker
+      - name: Record source identity
+        id: identity
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          contract = json.loads(Path('resources/preloop-runtime.json').read_text())
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert commit == os.environ['SOURCE_SHA']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"version={contract['runtime_version']}\ncommit={commit}\n")
+          PY
+      - name: Package provenance-bound draft release
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          python3 tools/preloop-release.py \
+            --binary-dir target/x86_64-unknown-linux-musl/release \
+            --output-dir "$RUNNER_TEMP/preloop-release" \
+            --validation-evidence "$VALIDATION_EVIDENCE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: preloop-fork-runtime
+          path: ${{ runner.temp }}/preloop-release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  draft-release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: preloopdev/firecracker
+      SOURCE_SHA: ${{ needs.build.outputs.commit }}
+      RUNTIME_VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: preloop-fork-runtime
+          path: release
+      - name: Check downloaded artifact provenance
+        working-directory: release
+        run: |
+          sha256sum --check SHA256SUMS
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path('provenance.json').read_text())
+          assert data['source_commit'] == os.environ['SOURCE_SHA']
+          assert data['source_tag'] == os.environ['RUNTIME_VERSION']
+          assert data['source_repository'] == 'preloopdev/firecracker'
+          PY
+      - name: Create draft only; never publish or deploy automatically
+        run: |
+          if tag_commit=$(gh api "repos/$GH_REPO/commits/$RUNTIME_VERSION" --jq .sha 2>/dev/null); then
+            [[ "$tag_commit" == "$SOURCE_SHA" ]]
+          fi
+          gh release create "$RUNTIME_VERSION" release/* \
+            --repo "$GH_REPO" --target "$SOURCE_SHA" --draft --prerelease \
+            --title "Preloop Firecracker $RUNTIME_VERSION" \
+            --notes "Fork runtime based on official v1.17.0, snapshot schema 13.0.0. Build provenance and checksums are attached. DRAFT: this CI build does not establish KVM, seccomp, old-runtime coexistence, or AgentENV lifecycle compatibility. Publish only after validating these exact artifact bytes on the isolated host and attaching the observed results. No automatic production deployment."

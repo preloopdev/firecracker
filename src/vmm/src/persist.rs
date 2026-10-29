@@ -898,7 +898,7 @@ mod tests {
         )
         .unwrap();
 
-        let mappings = build_uffd_mappings(regions.iter(), HugePageConfig::None);
+        let mappings = build_uffd_mappings(regions.iter().map(|region| &**region), HugePageConfig::None);
 
         assert_eq!(mappings.len(), 2);
 

@@ -4,7 +4,7 @@
 pub mod async_io;
 pub mod sync_io;
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::fmt::Debug;
 use std::fs::File;
 
@@ -55,12 +55,14 @@ impl AlignedBuf {
     /// Returns `None` if `alignment` is not a power of two, or if the system
     /// allocator fails.
     pub fn new(len: usize, alignment: usize) -> Option<Self> {
-        // Round up to the next multiple of `alignment` so the buffer length
-        // also satisfies O_DIRECT's length-alignment requirement.
-        let aligned_len = len.next_multiple_of(alignment);
+        if !alignment.is_power_of_two() {
+            return None;
+        }
+        let aligned_len = len.checked_next_multiple_of(alignment)?.max(alignment);
         let layout = Layout::from_size_align(aligned_len, alignment).ok()?;
-        // SAFETY: layout is valid (non-zero size, power-of-two alignment).
-        let ptr = unsafe { alloc(layout) };
+        // SAFETY: layout has nonzero size and valid alignment. Zero initialization
+        // makes the byte slices valid even before a read fills the buffer.
+        let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             return None;
         }
@@ -282,6 +284,8 @@ impl FileEngine {
 pub mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use std::os::unix::ffi::OsStrExt;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
 
     use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
     use vmm_sys_util::tempfile::TempFile;
@@ -351,6 +355,60 @@ pub mod tests {
         let bitmap = mem.find_region(addr).unwrap().bitmap();
         for offset in addr.0..addr.0 + u64::from(len) {
             assert!(!bitmap.dirty_at(u64_to_usize(offset)));
+        }
+    }
+
+    #[test]
+    fn test_aligned_bounce_buffer() {
+        for len in [0, 1, 511, 512, 4096] {
+            let buffer = AlignedBuf::new(len, DIRECT_IO_ALIGN).unwrap();
+            assert!((buffer.as_ptr() as usize).is_multiple_of(DIRECT_IO_ALIGN));
+            assert_eq!(buffer.as_slice(), vec![0; len]);
+        }
+        assert!(AlignedBuf::new(1, 0).is_none());
+        assert!(AlignedBuf::new(1, 3).is_none());
+        assert!(AlignedBuf::new(usize::MAX, DIRECT_IO_ALIGN).is_none());
+    }
+
+    #[test]
+    fn test_direct_io_aligned_and_unaligned_guest_buffers() {
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            let backing = TempFile::new().unwrap();
+            backing.as_file().set_len(8192).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(backing.as_path())
+                .unwrap();
+            let mut engine = FileEngine::from_file(file, engine_type, true).unwrap();
+            for guest_offset in [0, 1] {
+                let addr = GuestAddress(guest_offset);
+                let mem = create_mem();
+                let data = vec![0x5a; 4096];
+                mem.write_slice(&data, addr).unwrap();
+                let result = engine.write(0, &mem, addr, 4096, PendingRequest::default());
+                match engine_type {
+                    FileEngineType::Sync => assert_sync_execution!(result, 4096),
+                    FileEngineType::Async => {
+                        assert_queued!(result);
+                        assert_async_execution(&mem, &mut engine, 4096);
+                    }
+                }
+                let restored = create_mem();
+                let result = engine.read(0, &restored, addr, 4096, PendingRequest::default());
+                match engine_type {
+                    FileEngineType::Sync => assert_sync_execution!(result, 4096),
+                    FileEngineType::Async => {
+                        assert_queued!(result);
+                        assert_async_execution(&restored, &mut engine, 4096);
+                    }
+                }
+                let mut actual = vec![0; 4096];
+                restored.read_slice(&mut actual, addr).unwrap();
+                assert_eq!(actual, data);
+                check_dirty_mem(&restored, addr, 4096);
+            }
         }
     }
 

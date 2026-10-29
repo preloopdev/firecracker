@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "runtime_version": "v1.17.0-preloop.1",
+  "source_repository": "preloopdev/firecracker",
+  "upstream_repository": "firecracker-microvm/firecracker",
+  "upstream_tag": "v1.17.0",
+  "upstream_commit": "95f868c8e345b1cc8faccd1a3c910b4989dc3f58",
+  "patch_source_repository": "kvcache-ai/firecracker",
+  "patch_source_commit": "9fbc98e4dc05d03e1f00902ba4bb796395465099",
+  "patch_commits": [
+    "c3ec7aef79d09defa6b442e37d5179b848ab710b",
+    "caccb127bc7705a2423b048b0b0b00a6b401b8c9",
+    "d571a6501f03a08f9134ac1b8a72afe00c9c1f7c",
+    "8c42a29d0cfba03c4a30dc832330448de4855575",
+    "41385d4eaca425268ee8035620304160fe0ddc85",
+    "2a6598dc058b6e4275c8742669adb363cef01405",
+    "90288c397d6d3fa576f9d367d997bdeebf835f10",
+    "dcb1186cf03649783ffafc75fdeb93ffa3f21dbb",
+    "9fbc98e4dc05d03e1f00902ba4bb796395465099"
+  ],
+  "snapshot_version": "13.0.0",
+  "target": "x86_64-unknown-linux-musl",
+  "required_features": [
+    "dirty-memory-ranges-preserve",
+    "guest-memory-regions-gpa",
+    "direct-drive-io",
+    "state-only-snapshot",
+    "seek-memory-image-size",
+    "seek-pmem-size",
+    "kvm-prefault-memory"
+  ]
+}

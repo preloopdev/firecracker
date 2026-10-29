@@ -613,9 +613,10 @@ fn pre_fault_action(gpa: u64, size: u64) -> VmmAction {
 }
 
 fn assert_pre_fault_recovery(vmm: &Arc<Mutex<Vmm>>) {
+    let mut event_manager = EventManager::new().unwrap();
     let mut controller = RuntimeApiController::new(vmm.clone());
-    controller.handle_request(VmmAction::Resume).unwrap();
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Resume, &mut event_manager).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
 
     let vm_info = {
         let locked_vmm = vmm.lock().unwrap();
@@ -661,22 +662,20 @@ fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmAct
 fn test_prefault_memory_state_validation_recovery_and_repeated_calls() {
     use vmm::vstate::prefault::PreFaultMemoryValidationError;
 
-    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+    let (vmm, mut event_manager) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
     let mut controller = RuntimeApiController::new(vmm.clone());
 
-    controller.handle_request(VmmAction::Resume).unwrap();
-    let error = controller
-        .handle_request(pre_fault_action(0, 0x1000))
+    controller.handle_request(VmmAction::Resume, &mut event_manager).unwrap();
+    let error = controller.handle_request(pre_fault_action(0, 0x1000), &mut event_manager)
         .unwrap_err();
     assert!(matches!(
         error,
         VmmActionError::PreFaultMemory(PreFaultMemoryError::VmNotPaused(VmState::Running))
     ));
-    controller.handle_request(VmmAction::Pause).unwrap();
+    controller.handle_request(VmmAction::Pause, &mut event_manager).unwrap();
 
     let mut reject = |request, expected| {
-        let error = controller
-            .handle_request(VmmAction::PreFaultMemory(request))
+        let error = controller.handle_request(VmmAction::PreFaultMemory(request), &mut event_manager)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -713,17 +712,16 @@ fn test_prefault_memory_state_validation_recovery_and_repeated_calls() {
         PreFaultMemoryValidationError::AddressOverflow(0),
     );
 
-    let error = controller
-        .handle_request(pre_fault_action(0x2000_0000, 0x1000))
+    let error = controller.handle_request(pre_fault_action(0x2000_0000, 0x1000), &mut event_manager)
         .unwrap_err();
     assert!(matches!(
         error,
         VmmActionError::PreFaultMemory(PreFaultMemoryError::NotGuestRam(0))
     ));
 
-    let first_result = controller.handle_request(pre_fault_action(0, 0x1000));
+    let first_result = controller.handle_request(pre_fault_action(0, 0x1000), &mut event_manager);
     assert_pre_fault_supported_or_host_unsupported(first_result);
-    let second_result = controller.handle_request(pre_fault_action(0x1000, 0x1000));
+    let second_result = controller.handle_request(pre_fault_action(0x1000, 0x1000), &mut event_manager);
     assert_pre_fault_supported_or_host_unsupported(second_result);
 
     // Rejected requests sent no work; verify that the VM remains usable. The repeated calls above
@@ -765,7 +763,7 @@ fn test_prefault_memory_multi_vcpu_preserves_split_bytes_and_control_channel() {
 
     use vmm::vstate::prefault::split_pre_fault_ranges;
 
-    let (vmm, _) = multi_vcpu_vmm_no_boot();
+    let (vmm, mut event_manager) = multi_vcpu_vmm_no_boot();
     assert_eq!(vmm.lock().unwrap().machine_config.vcpu_count, 2);
 
     let ranges = vec![
@@ -804,7 +802,7 @@ fn test_prefault_memory_multi_vcpu_preserves_split_bytes_and_control_channel() {
     assert_eq!(observed_pages, expected_pages);
 
     let mut controller = RuntimeApiController::new(vmm.clone());
-    let result = controller.handle_request(VmmAction::PreFaultMemory(request));
+    let result = controller.handle_request(VmmAction::PreFaultMemory(request), &mut event_manager);
     assert_pre_fault_supported_or_host_unsupported(result);
 
     assert_pre_fault_recovery(&vmm);
@@ -821,7 +819,7 @@ fn hotplug_vmm_no_boot(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventMan
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn test_prefault_memory_rejects_hotpluggable_region() {
-    use vm_memory::{GuestMemory, GuestMemoryRegion};
+    use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
 
     use vmm::vstate::memory::GuestRegionType;
 
@@ -829,12 +827,12 @@ fn test_prefault_memory_rejects_hotpluggable_region() {
     // backing KVM slot exists: a single active virtio-mem block can mark the whole slot as plugged
     // without every byte belonging to the guest. Resolve the hotpluggable region's start address
     // dynamically so the test does not depend on the host allocator's layout.
-    let (vmm, _) = hotplug_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+    let (vmm, mut event_manager) = hotplug_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
     let mut controller = RuntimeApiController::new(vmm.clone());
 
     let hotplug_start = {
         let locked = vmm.lock().unwrap();
-        let guest_memory = locked.vm.guest_memory();
+        let guest_memory = locked.vm.as_kvm().unwrap().guest_memory();
         guest_memory
             .iter()
             .find(|region| region.region_type == GuestRegionType::Hotpluggable)
@@ -843,8 +841,7 @@ fn test_prefault_memory_rejects_hotpluggable_region() {
     };
     assert_eq!(hotplug_start % 0x1000, 0);
 
-    let error = controller
-        .handle_request(pre_fault_action(hotplug_start, 0x1000))
+    let error = controller.handle_request(pre_fault_action(hotplug_start, 0x1000), &mut event_manager)
         .unwrap_err();
     assert!(
         matches!(

@@ -9,6 +9,67 @@ container and function workloads.
 
 Read more about the Firecracker Charter [here](CHARTER.md).
 
+## Preloop fork runtime
+
+This fork ports the kvcache-ai runtime contract onto official v1.17.0
+(`95f868c8e345b1cc8faccd1a3c910b4989dc3f58`). Exact upstream and patch
+provenance is recorded in `resources/preloop-runtime.json`; the runtime key
+is `v1.17.0-preloop.1`.
+
+The fork's snapshot format is **13.0.0** because block-device state now
+persists the `direct` flag in addition to upstream v1.17's format-12 state.
+This is not a compatibility promise. Keep v9 snapshots with their original
+fork runtime; do not relabel or blindly convert snapshot headers. Stock
+Firecracker binaries do not implement the fork API contract.
+
+Build on an isolated Linux x86_64 host, not on a production runtime tree:
+
+```sh
+rustup toolchain install 1.97.0 --profile minimal --target x86_64-unknown-linux-musl
+CARGO_BUILD_JOBS=2 cargo +1.97.0 build --locked --release \
+  --target x86_64-unknown-linux-musl -p firecracker -p jailer -p cpu-template-helper
+CARGO_BUILD_JOBS=2 cargo +1.97.0 test --locked --no-run \
+  --target x86_64-unknown-linux-musl -p vmm -p firecracker
+```
+
+Compilation alone is insufficient. Before publishing, run the ported Rust
+tests and the upstream integration suite on KVM with the **exact release
+binaries and default seccomp filters**. Validate dirty-range queries preserve
+dirty state, guest GPA holes differ from contiguous image offsets, state-only
+and full/diff snapshots restore correctly, sync/async O_DIRECT handles aligned
+and unaligned buffers and persists across restore/backing-file replacement,
+memory/pmem block-device sizes use seek, and prefault rejects invalid/running/
+hotplug ranges and recovers its control channel on supported and unsupported
+hosts. Then run AgentENV cold/warm boot, full/diff/UBLK snapshot restoration,
+stop/restart, concurrent old/new runtimes, and rollback to the old runtime.
+Old snapshots must remain assigned to their original runtime throughout.
+
+After recording those results, package the already-built artifacts from a
+clean committed source tree (the evidence URL records observations; the
+packager does not assert that a test passed):
+
+```sh
+python3 tools/preloop-release.py \
+  --binary-dir target/x86_64-unknown-linux-musl/release \
+  --output-dir /tmp/preloop-runtime-release \
+  --validation-evidence https://github.com/preloopdev/firecracker/pull/NUMBER
+```
+
+The archive contains Firecracker, jailer, cpu-template-helper, API schema,
+seccomp source and license files. `provenance.json` binds source commit,
+upstream/patch provenance, snapshot schema, actual packaging toolchain,
+archive SHA-256 and individual binary hashes. `SHA256SUMS` covers the archive
+and provenance. Validate the source tag resolves to `source_commit` and the
+GitHub asset digest agrees with these hashes before installing.
+
+The **Preloop fork runtime build** workflow compiles PRs; a manual run for a
+full source SHA builds and creates only a **draft** release on this fork.
+It never publishes or deploys. Workflow-built bytes must undergo the same
+isolated KVM/lifecycle checks before a maintainer publishes that draft.
+Release downloads use
+`https://github.com/preloopdev/firecracker/releases/download/v1.17.0-preloop.1/firecracker-v1.17.0-preloop.1-x86_64.tgz`;
+this is a release contract, not a statement that the artifact already exists.
+
 ## What is Firecracker?
 
 Firecracker is an open source virtualization technology that is purpose-built
