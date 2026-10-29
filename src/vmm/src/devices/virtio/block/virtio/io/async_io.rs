@@ -9,13 +9,15 @@ use std::os::unix::io::AsRawFd;
 use vm_memory::{GuestMemoryBackend, GuestMemoryError};
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::devices::virtio::block::virtio::io::RequestError;
+use super::{AlignedBuf, DIRECT_IO_ALIGN, RequestError};
 use crate::devices::virtio::block::virtio::{IO_URING_NUM_ENTRIES, PendingRequest};
 use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
 use crate::logger::log_dev_preview_warning;
-use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
+use crate::vstate::memory::{
+    Bytes, GuestAddress, GuestMemoryExtension, GuestMemoryMmap,
+};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum AsyncIoError {
@@ -33,6 +35,8 @@ pub enum AsyncIoError {
     EventFd(std::io::Error),
     /// GuestMemory: {0}
     GuestMemory(GuestMemoryError),
+    /// BounceBufferAlloc: failed to allocate aligned bounce buffer
+    BounceBufferAlloc,
 }
 
 #[derive(Debug)]
@@ -40,32 +44,79 @@ pub struct AsyncFileEngine {
     file: File,
     ring: IoUring<WrappedRequest>,
     completion_evt: EventFd,
+    direct: bool,
 }
 
+/// Wraps a `PendingRequest` with optional dirty-tracking info and an optional
+/// bounce buffer for O_DIRECT I/O with unaligned guest memory addresses.
 #[derive(Debug)]
 pub struct WrappedRequest {
+    /// Guest address to mark dirty on read completion (for dirty tracking).
     addr: Option<GuestAddress>,
     req: PendingRequest,
+    /// Bounce buffer held alive for the duration of the in-flight io_uring op.
+    /// On read completion, data is copied from this buffer to guest memory.
+    bounce_buf: Option<AlignedBuf>,
 }
 
 impl WrappedRequest {
     fn new(req: PendingRequest) -> Self {
-        WrappedRequest { addr: None, req }
+        WrappedRequest {
+            addr: None,
+            req,
+            bounce_buf: None,
+        }
     }
 
     fn new_with_dirty_tracking(addr: GuestAddress, req: PendingRequest) -> Self {
         WrappedRequest {
             addr: Some(addr),
             req,
+            bounce_buf: None,
         }
     }
 
-    fn mark_dirty_mem_and_unwrap(self, mem: &GuestMemoryMmap, count: u32) -> PendingRequest {
-        if let Some(addr) = self.addr {
-            mem.mark_dirty(addr, count as usize)
+    fn new_with_bounce_buf(
+        addr: GuestAddress,
+        req: PendingRequest,
+        bounce_buf: AlignedBuf,
+    ) -> Self {
+        WrappedRequest {
+            addr: Some(addr),
+            req,
+            bounce_buf: Some(bounce_buf),
         }
+    }
 
-        self.req
+    fn mark_dirty_mem_and_unwrap(
+        self,
+        mem: &GuestMemoryMmap,
+        count: u32,
+    ) -> Result<PendingRequest, RequestError<AsyncIoError>> {
+        let WrappedRequest {
+            addr,
+            req,
+            bounce_buf,
+        } = self;
+
+        if let Some(addr) = addr {
+            // If there is a bounce buffer, this was a read: copy data to guest memory.
+            if let Some(ref bounce) = bounce_buf {
+                let data = &bounce.as_slice()[..count as usize];
+                if let Err(err) = mem.write_slice(data, addr) {
+                    crate::logger::error!(
+                        "Failed to copy bounce buffer to guest memory: {:?}",
+                        err
+                    );
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::GuestMemory(err),
+                    });
+                }
+            }
+            mem.mark_dirty(addr, count as usize);
+        }
+        Ok(req)
     }
 }
 
@@ -89,7 +140,7 @@ impl AsyncFileEngine {
         )
     }
 
-    pub fn from_file(file: File) -> Result<AsyncFileEngine, AsyncIoError> {
+    pub fn from_file(file: File, direct: bool) -> Result<AsyncFileEngine, AsyncIoError> {
         log_dev_preview_warning("Async file IO", Option::None);
 
         let completion_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(AsyncIoError::EventFd)?;
@@ -100,15 +151,18 @@ impl AsyncFileEngine {
             file,
             ring,
             completion_evt,
+            direct,
         })
     }
 
-    pub fn update_file(&mut self, file: File) -> Result<(), AsyncIoError> {
+    /// Update the backing file and the direct-IO flag.
+    pub fn update_file(&mut self, file: File, direct: bool) -> Result<(), AsyncIoError> {
         let ring = Self::new_ring(&file, self.completion_evt.as_raw_fd())
             .map_err(AsyncIoError::IoUring)?;
 
         self.file = file;
         self.ring = ring;
+        self.direct = direct;
         Ok(())
     }
 
@@ -120,6 +174,11 @@ impl AsyncFileEngine {
         &self.completion_evt
     }
 
+    /// Returns true if the guest address requires a bounce buffer for O_DIRECT.
+    fn needs_bounce_buf(&self, addr: GuestAddress) -> bool {
+        self.direct && !addr.0.is_multiple_of(DIRECT_IO_ALIGN as u64)
+    }
+
     pub fn push_read(
         &mut self,
         offset: u64,
@@ -128,30 +187,59 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
-        let buf = match mem.get_slice(addr, count as usize) {
-            Ok(slice) => slice.ptr_guard_mut().as_ptr(),
-            Err(err) => {
-                return Err(RequestError {
-                    req,
-                    error: AsyncIoError::GuestMemory(err),
-                });
-            }
-        };
+        if self.needs_bounce_buf(addr) {
+            // Allocate an aligned bounce buffer; the io_uring read will go into it.
+            // On completion, the data will be copied to guest memory in pop().
+            let bounce = match AlignedBuf::new(count as usize, DIRECT_IO_ALIGN) {
+                Some(b) => b,
+                None => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::BounceBufferAlloc,
+                    });
+                }
+            };
+            let buf_ptr = bounce.as_ptr();
+            let wrapped_user_data = WrappedRequest::new_with_bounce_buf(addr, req, bounce);
 
-        let wrapped_user_data = WrappedRequest::new_with_dirty_tracking(addr, req);
+            self.ring
+                .push(Operation::read(
+                    0,
+                    buf_ptr as usize,
+                    count,
+                    offset,
+                    wrapped_user_data,
+                ))
+                .map_err(|(io_uring_error, data)| RequestError {
+                    req: data.req,
+                    error: AsyncIoError::IoUring(io_uring_error),
+                })
+        } else {
+            let buf = match mem.get_slice(addr, count as usize) {
+                Ok(slice) => slice.ptr_guard_mut().as_ptr(),
+                Err(err) => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::GuestMemory(err),
+                    });
+                }
+            };
 
-        self.ring
-            .push(Operation::read(
-                0,
-                buf as usize,
-                count,
-                offset,
-                wrapped_user_data,
-            ))
-            .map_err(|(io_uring_error, data)| RequestError {
-                req: data.req,
-                error: AsyncIoError::IoUring(io_uring_error),
-            })
+            let wrapped_user_data = WrappedRequest::new_with_dirty_tracking(addr, req);
+
+            self.ring
+                .push(Operation::read(
+                    0,
+                    buf as usize,
+                    count,
+                    offset,
+                    wrapped_user_data,
+                ))
+                .map_err(|(io_uring_error, data)| RequestError {
+                    req: data.req,
+                    error: AsyncIoError::IoUring(io_uring_error),
+                })
+        }
     }
 
     pub fn push_write(
@@ -162,30 +250,69 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
-        let buf = match mem.get_slice(addr, count as usize) {
-            Ok(slice) => slice.ptr_guard_mut().as_ptr(),
-            Err(err) => {
+        if self.needs_bounce_buf(addr) {
+            // Copy guest data into an aligned bounce buffer, then submit write from it.
+            let mut bounce = match AlignedBuf::new(count as usize, DIRECT_IO_ALIGN) {
+                Some(b) => b,
+                None => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::BounceBufferAlloc,
+                    });
+                }
+            };
+            if let Err(err) = mem.read_slice(bounce.as_mut_slice(), addr) {
                 return Err(RequestError {
                     req,
                     error: AsyncIoError::GuestMemory(err),
                 });
             }
-        };
+            let buf_ptr = bounce.as_ptr();
+            // No dirty-tracking needed for writes; bounce_buf is dropped at completion.
+            let wrapped_user_data = WrappedRequest {
+                addr: None,
+                req,
+                bounce_buf: Some(bounce),
+            };
 
-        let wrapped_user_data = WrappedRequest::new(req);
+            self.ring
+                .push(Operation::write(
+                    0,
+                    buf_ptr as usize,
+                    count,
+                    offset,
+                    wrapped_user_data,
+                ))
+                .map_err(|(io_uring_error, data)| RequestError {
+                    req: data.req,
+                    error: AsyncIoError::IoUring(io_uring_error),
+                })
+        } else {
+            let buf = match mem.get_slice(addr, count as usize) {
+                Ok(slice) => slice.ptr_guard_mut().as_ptr(),
+                Err(err) => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::GuestMemory(err),
+                    });
+                }
+            };
 
-        self.ring
-            .push(Operation::write(
-                0,
-                buf as usize,
-                count,
-                offset,
-                wrapped_user_data,
-            ))
-            .map_err(|(io_uring_error, data)| RequestError {
-                req: data.req,
-                error: AsyncIoError::IoUring(io_uring_error),
-            })
+            let wrapped_user_data = WrappedRequest::new(req);
+
+            self.ring
+                .push(Operation::write(
+                    0,
+                    buf as usize,
+                    count,
+                    offset,
+                    wrapped_user_data,
+                ))
+                .map_err(|(io_uring_error, data)| RequestError {
+                    req: data.req,
+                    error: AsyncIoError::IoUring(io_uring_error),
+                })
+        }
     }
 
     pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<AsyncIoError>> {
@@ -243,13 +370,22 @@ impl AsyncFileEngine {
         &mut self,
         mem: &GuestMemoryMmap,
     ) -> Result<Option<Cqe<PendingRequest>>, AsyncIoError> {
-        let cqe = self.do_pop()?.map(|cqe| {
-            let count = cqe.count();
-            cqe.map_user_data(|wrapped_user_data| {
-                wrapped_user_data.mark_dirty_mem_and_unwrap(mem, count)
-            })
-        });
-
-        Ok(cqe)
+        let Some(cqe) = self.do_pop()? else {
+            return Ok(None);
+        };
+        let count = cqe.count();
+        let result = cqe.result();
+        let wrapped_request = cqe.user_data();
+        let req = match wrapped_request.mark_dirty_mem_and_unwrap(mem, count) {
+            Ok(req) => req,
+            Err(err) => {
+                return Ok(Some(Cqe::new(-libc::EFAULT, err.req)));
+            }
+        };
+        Ok(Some(match result {
+            // SAFETY: result() just convert it from i32
+            Ok(count) => Cqe::new(i32::try_from(count).unwrap(), req),
+            Err(err) => Cqe::new(err.raw_os_error().unwrap_or(-libc::EIO), req),
+        }))
     }
 }

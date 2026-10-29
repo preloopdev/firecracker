@@ -106,6 +106,7 @@ impl From<VhostUserBlockConfig> for BlockDeviceConfig {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: Some(value.socket),
         }
@@ -425,6 +426,7 @@ mod tests {
             file_engine_type: None,
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: Some("sock".to_string()),
         };
@@ -443,6 +445,7 @@ mod tests {
             file_engine_type: Some(FileEngineType::Sync),
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: None,
         };
@@ -461,6 +464,7 @@ mod tests {
             file_engine_type: Some(FileEngineType::Sync),
             blk_size: None,
             topology: None,
+            direct: None,
 
             socket: Some("sock".to_string()),
         };

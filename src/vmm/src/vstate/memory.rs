@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
-use std::io::SeekFrom;
+use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,28 @@ use crate::utils::{mib_to_bytes, u64_to_usize};
 use crate::vmm_config::machine_config::HugePageConfig;
 use crate::vstate::vm::{KvmVm, VmError};
 use crate::{DirtyBitmap, align_up, warn_unrestricted};
+
+/// A contiguous dirty memory range in the snapshot memory image layout.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirtyMemoryRange {
+    /// Base host virtual address where this dirty range currently resides.
+    pub base_host_virt_addr: u64,
+    /// Offset in the contiguous memory snapshot image.
+    pub image_offset: u64,
+    /// Length of the dirty range in bytes.
+    pub length: u64,
+}
+
+/// Dirty memory ranges for a VM, using the same contiguous layout as memory snapshots.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirtyMemoryRanges {
+    /// Page size used when interpreting dirty bits.
+    pub page_size: usize,
+    /// Total size of the contiguous memory snapshot image.
+    pub memory_size: u64,
+    /// Dirty ranges coalesced across adjacent pages within each memory slot.
+    pub ranges: Vec<DirtyMemoryRange>,
+}
 
 /// Type of GuestMemoryMmap.
 pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
@@ -438,6 +460,66 @@ impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
 }
 
 impl<'a> GuestMemorySlot<'a> {
+    /// Appends dirty ranges for this slot, coalescing adjacent dirty pages.
+    pub(crate) fn append_dirty_ranges(
+        &self,
+        ranges: &mut Vec<DirtyMemoryRange>,
+        kvm_bitmap: &[u64],
+        page_size: usize,
+        image_offset: u64,
+    ) -> Result<(), MemoryError> {
+        let firecracker_bitmap = self.slice.bitmap();
+        let base_host_virt_addr = self.slice.ptr_guard().as_ptr() as u64;
+        let mut dirty_range_start = None;
+
+        let expected_bitmap_array_len = (self.slice.len() / page_size).div_ceil(64);
+        if kvm_bitmap.len() > expected_bitmap_array_len {
+            return Err(MemoryError::DirtyBitmapTooLarge);
+        } else if kvm_bitmap.len() < expected_bitmap_array_len {
+            return Err(MemoryError::DirtyBitmapTooSmall);
+        }
+
+        for (i, v) in kvm_bitmap.iter().enumerate() {
+            for j in 0..64 {
+                let page_offset = ((i * 64) + j) * page_size;
+
+                // We process 64 pages at a time, however the number of pages
+                // in the slot might not be a multiple of 64. We need to break
+                // once we go past the last page that is actually part of the
+                // region.
+                if page_offset >= self.slice.len() {
+                    // Ensure there are no more dirty bits after this point.
+                    if (v >> j) != 0 {
+                        return Err(MemoryError::DirtyBitmapTooLarge);
+                    }
+                    break;
+                }
+
+                let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
+                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
+                if is_kvm_page_dirty || is_firecracker_page_dirty {
+                    dirty_range_start.get_or_insert(page_offset);
+                } else if let Some(start) = dirty_range_start.take() {
+                    ranges.push(DirtyMemoryRange {
+                        base_host_virt_addr: base_host_virt_addr + start as u64,
+                        image_offset: image_offset + start as u64,
+                        length: (page_offset - start) as u64,
+                    });
+                }
+            }
+        }
+
+        if let Some(start) = dirty_range_start {
+            ranges.push(DirtyMemoryRange {
+                base_host_virt_addr: base_host_virt_addr + start as u64,
+                image_offset: image_offset + start as u64,
+                length: (self.slice.len() - start) as u64,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Dumps the dirty pages in this slot onto the writer
     pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
@@ -962,7 +1044,7 @@ pub fn anonymous(
 /// Creates a GuestMemoryMmap given a `file` containing the data
 /// and a `state` containing mapping information.
 pub fn snapshot_file(
-    file: File,
+    mut file: File,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
@@ -972,7 +1054,13 @@ pub fn snapshot_file(
         .iter()
         .try_fold(0u64, |acc, (_, size)| acc.checked_add(*size as u64))
         .ok_or(MemoryError::OffsetTooLarge)?;
-    let file_size = file.metadata().map_err(MemoryError::FileMetadata)?.len();
+    // Use `lseek(SEEK_END)` rather than `fstat` to determine the backing file size.
+    // For block devices (e.g. ublk, dm-snapshot) `fstat` returns `st_size = 0`,
+    // whereas `lseek(SEEK_END)` returns the actual device capacity. For regular
+    // files both yield the same value, so behaviour is preserved.
+    let file_size = file
+        .seek(SeekFrom::End(0))
+        .map_err(MemoryError::SeekError)?;
 
     // ensure we do not mmap beyond EOF. The kernel would allow that but a SIGBUS is triggered
     // on an attempted access to a page of the buffer that lies beyond the end of the mapped file.
@@ -1009,6 +1097,13 @@ where
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError>;
+
+    /// Returns dirty ranges using the same dirty page semantics as [`Self::dump_dirty`].
+    fn dirty_memory_ranges(
+        &self,
+        dirty_bitmap: &DirtyBitmap,
+        page_size: usize,
+    ) -> Result<DirtyMemoryRanges, MemoryError>;
 
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self);
@@ -1139,6 +1234,32 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         }
 
         write_result
+    }
+
+    /// Returns dirty ranges using the same dirty page semantics as [`Self::dump_dirty`].
+    fn dirty_memory_ranges(
+        &self,
+        dirty_bitmap: &DirtyBitmap,
+        page_size: usize,
+    ) -> Result<DirtyMemoryRanges, MemoryError> {
+        let mut ranges = Vec::new();
+        let mut image_offset = 0u64;
+
+        for (mem_slot, plugged) in self.iter().flat_map(|region| region.slots()) {
+            if plugged {
+                let kvm_bitmap = dirty_bitmap
+                    .get(&mem_slot.slot)
+                    .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
+                mem_slot.append_dirty_ranges(&mut ranges, kvm_bitmap, page_size, image_offset)?;
+            }
+            image_offset += mem_slot.slice.len() as u64;
+        }
+
+        Ok(DirtyMemoryRanges {
+            page_size,
+            memory_size: image_offset,
+            ranges,
+        })
     }
 
     /// Resets all the memory region bitmaps
@@ -1745,6 +1866,56 @@ mod tests {
             guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
             Err(MemoryError::DirtyBitmapTooSmall)
         ));
+    }
+
+    #[test]
+    fn test_dirty_memory_ranges() {
+        let page_size = host_page_size();
+
+        // Two regions of four pages each, with a one page GPA gap between them.
+        let region_1_address = GuestAddress(0);
+        let region_2_address = GuestAddress(page_size as u64 * 5);
+        let region_size = page_size * 4;
+        let mem_regions = [
+            (region_1_address, region_size),
+            (region_2_address, region_size),
+        ];
+        let guest_memory = into_region_ext(
+            anonymous(mem_regions.into_iter(), true, HugePageConfig::None).unwrap(),
+        );
+
+        // Firecracker bitmap: first region page 1 is dirty.
+        guest_memory
+            .write(&vec![1u8; page_size], GuestAddress(page_size as u64))
+            .unwrap();
+
+        // KVM bitmap:
+        // First region pages: [dirty, clean, dirty, clean]
+        // Second region pages: [clean, dirty, clean, dirty]
+        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+        kvm_dirty_bitmap.insert(0, vec![0b0101]);
+        kvm_dirty_bitmap.insert(1, vec![0b1010]);
+
+        let dirty_ranges = guest_memory
+            .dirty_memory_ranges(&kvm_dirty_bitmap, page_size)
+            .unwrap();
+
+        assert_eq!(dirty_ranges.page_size, page_size);
+        assert_eq!(dirty_ranges.memory_size, (region_size * 2) as u64);
+        assert_eq!(dirty_ranges.ranges.len(), 3);
+        assert_ne!(dirty_ranges.ranges[0].base_host_virt_addr, 0);
+        assert_eq!(dirty_ranges.ranges[0].image_offset, 0);
+        assert_eq!(dirty_ranges.ranges[0].length, (page_size * 3) as u64);
+        assert_eq!(
+            dirty_ranges.ranges[1].image_offset,
+            (region_size + page_size) as u64
+        );
+        assert_eq!(dirty_ranges.ranges[1].length, page_size as u64);
+        assert_eq!(
+            dirty_ranges.ranges[2].image_offset,
+            (region_size + page_size * 3) as u64
+        );
+        assert_eq!(dirty_ranges.ranges[2].length, page_size as u64);
     }
 
     #[test]

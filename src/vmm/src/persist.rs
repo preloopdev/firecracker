@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use vm_memory::{Address, GuestMemoryRegion, MemoryRegionAddress};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -114,6 +115,12 @@ pub struct GuestRegionUffdMapping {
     /// Base host virtual address where the guest memory contents for this
     /// region should be copied/populated.
     pub base_host_virt_addr: u64,
+    /// Guest physical address at which this memory region begins.
+    ///
+    /// Unlike [`Self::offset`], this address preserves holes in the guest
+    /// physical address space and can therefore be used to translate a host
+    /// virtual address in this region back to a GPA.
+    pub guest_phys_addr: u64,
     /// Region size.
     pub size: usize,
     /// Offset in the backend file/buffer where the region contents are.
@@ -163,7 +170,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -181,22 +188,24 @@ pub fn create_snapshot(
         params.sync_snapshot_files,
     )?;
 
-    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
-        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-            "snapshot requires KVM".into(),
-        ))
-    })?;
-    kvm_vm.snapshot_memory_to_file(
-        &params.mem_file_path,
-        params.snapshot_type,
-        params.sync_snapshot_files,
-    )?;
+    if let Some(ref mem_file_path) = params.mem_file_path {
+        let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+            CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                "snapshot requires KVM".into(),
+            ))
+        })?;
+        kvm_vm.snapshot_memory_to_file(
+            mem_file_path,
+            params.snapshot_type,
+            params.sync_snapshot_files,
+        )?;
 
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+        // We need to mark queues as dirty again for all activated devices. The reason we
+        // do it here is that we don't mark pages as dirty during runtime
+        // for queue objects.
+        vmm.device_manager
+            .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+    }
 
     Ok(())
 }
@@ -586,26 +595,43 @@ fn guest_memory_from_uffd(
     Ok((guest_memory, Some(uffd)))
 }
 
+/// Builds a list of [`GuestRegionUffdMapping`]s from an iterator of memory regions.
+///
+/// Each mapping records the host virtual address, guest physical address,
+/// region size, cumulative byte offset within a contiguous layout of all
+/// regions, and the page size from the given [`HugePageConfig`]. This is the
+/// single source of truth for constructing these mappings — used by both the
+/// uffd restore path and the runtime `GET /vm/guest-memory-regions` API.
+pub fn build_uffd_mappings<'a, R: GuestMemoryRegion + 'a>(
+    regions: impl Iterator<Item = &'a R>,
+    huge_pages: HugePageConfig,
+) -> Vec<GuestRegionUffdMapping> {
+    let mut mappings = Vec::new();
+    let mut offset = 0;
+    for mem_region in regions {
+        #[allow(deprecated)]
+        mappings.push(GuestRegionUffdMapping {
+            base_host_virt_addr: mem_region
+                .get_host_address(MemoryRegionAddress(0))
+                .expect("memory regions are nonempty") as u64,
+            guest_phys_addr: mem_region.start_addr().raw_value(),
+            size: u64_to_usize(mem_region.len()),
+            offset,
+            page_size: huge_pages.page_size(),
+            page_size_kib: huge_pages.page_size(),
+        });
+        offset += mem_region.len();
+    }
+    mappings
+}
+
 fn create_guest_memory(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
     let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
-    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
-    let mut offset = 0;
-    for mem_region in guest_memory.iter() {
-        #[allow(deprecated)]
-        backend_mappings.push(GuestRegionUffdMapping {
-            base_host_virt_addr: mem_region.as_ptr() as u64,
-            size: mem_region.size(),
-            offset,
-            page_size: huge_pages.page_size(),
-            page_size_kib: huge_pages.page_size(),
-        });
-        offset += mem_region.size() as u64;
-    }
-
+    let backend_mappings = build_uffd_mappings(guest_memory.iter().map(|region| &**region), huge_pages);
     Ok((guest_memory, backend_mappings))
 }
 
@@ -816,6 +842,7 @@ mod tests {
         let uffd_regions = vec![
             GuestRegionUffdMapping {
                 base_host_virt_addr: 0,
+                guest_phys_addr: 0,
                 size: 0x100000,
                 offset: 0,
                 page_size: HugePageConfig::None.page_size(),
@@ -823,6 +850,7 @@ mod tests {
             },
             GuestRegionUffdMapping {
                 base_host_virt_addr: 0x100000,
+                guest_phys_addr: 0x200000,
                 size: 0x200000,
                 offset: 0,
                 page_size: HugePageConfig::Hugetlbfs2M.page_size(),
@@ -850,5 +878,43 @@ mod tests {
             serde_json::from_slice(&message_buf).unwrap();
 
         assert_eq!(uffd_regions, deserialized);
+    }
+
+    #[test]
+    fn test_build_uffd_mappings() {
+        use vm_memory::GuestAddress;
+
+        let regions = memory::anonymous(
+            [
+                (GuestAddress(0), 0x10000),
+                // Model the x86 MMIO hole: snapshot offsets stay contiguous,
+                // while GPAs must retain the physical-address gap.
+                (GuestAddress(0x1_0000_0000), 0x20000),
+            ]
+                .iter()
+                .copied(),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+
+        let mappings = build_uffd_mappings(regions.iter().map(|region| &**region), HugePageConfig::None);
+
+        assert_eq!(mappings.len(), 2);
+
+        // First region: offset starts at 0.
+        assert_ne!(mappings[0].base_host_virt_addr, 0);
+        assert_eq!(mappings[0].guest_phys_addr, 0);
+        assert_eq!(mappings[0].size, 0x10000);
+        assert_eq!(mappings[0].offset, 0);
+        assert_eq!(mappings[0].page_size, 4096);
+
+        // The second region's image offset is cumulative, but its GPA preserves
+        // the physical-address gap rather than treating the image as contiguous.
+        assert_ne!(mappings[1].base_host_virt_addr, 0);
+        assert_eq!(mappings[1].guest_phys_addr, 0x1_0000_0000);
+        assert_eq!(mappings[1].size, 0x20000);
+        assert_eq!(mappings[1].offset, 0x10000);
+        assert_eq!(mappings[1].page_size, 4096);
     }
 }

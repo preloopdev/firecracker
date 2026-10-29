@@ -312,6 +312,19 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_legacy_and_stock_snapshot_formats() {
+        for major in [9, 12] {
+            let mut snapshot = Snapshot::new(());
+            snapshot.header.version = Version::new(major, 0, 0);
+            let data = bitcode::serialize(&snapshot).unwrap();
+            assert!(matches!(
+                Snapshot::<()>::load_without_crc_check(&data),
+                Err(SnapshotError::InvalidFormatVersion(version)) if version.major == major
+            ));
+        }
+    }
+
+    #[test]
     fn test_bad_version() {
         // Different major version: shouldn't work
         let mut bad_snapshot = Snapshot::new(());

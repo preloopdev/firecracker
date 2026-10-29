@@ -1,0 +1,170 @@
+name: Preloop fork runtime release
+
+on:
+  pull_request:
+    branches: [preloop/stable-v1.17.0]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit that is also the head of preloop/runtime-v1.17.0 at dispatch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preloop-runtime-release-${{ github.event.pull_request.number || inputs.source_sha || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  RUNTIME_VERSION: v1.17.0-preloop.1
+  SOURCE_BRANCH: preloop/runtime-v1.17.0
+  RUST_CHANNEL: 1.97.0
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    if: github.repository == 'preloopdev/firecracker'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Require a full source commit
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Require the run to be built from the source commit
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "$GITHUB_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::GITHUB_SHA $GITHUB_SHA is not SOURCE_SHA $SOURCE_SHA; dispatch from a ref whose head is the source commit." >&2
+            exit 1
+          fi
+      - name: Check out the source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the commit to be on the release branch
+        run: git merge-base --is-ancestor "$SOURCE_SHA" "origin/$SOURCE_BRANCH"
+      - name: Install the pinned toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config libudev-dev
+          rustup toolchain install "$RUST_CHANNEL" --profile minimal --target "$TARGET"
+      - name: Fetch locked dependencies
+        run: cargo +"$RUST_CHANNEL" fetch --locked --target "$TARGET"
+      - name: Build the shipped runtime packages from the locked tree
+        run: |
+          packages=$(python3 -c 'import json; print(" ".join("-p " + p for p in json.load(open("resources/preloop-runtime.json"))["build_packages"]))')
+          cargo +"$RUST_CHANNEL" build --frozen --release --target "$TARGET" $packages
+      - name: Record the builder toolchain
+        run: |
+          {
+            rustc +"$RUST_CHANNEL" -Vv
+            cargo +"$RUST_CHANNEL" -V
+          } > "$RUNNER_TEMP/builder-toolchain.txt"
+      - name: Package this architecture
+        run: |
+          python3 tools/preloop-release.py package \
+            --arch "$ARCH" \
+            --binary-dir "target/$TARGET/release" \
+            --builder-toolchain "$RUNNER_TEMP/builder-toolchain.txt" \
+            --source-commit "$SOURCE_SHA" \
+            --output-dir "$RUNNER_TEMP/out"
+      - name: Attest the archive and provenance
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ runner.temp }}/out/*
+      - name: Upload the package for the index job
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 14
+
+  index:
+    name: index, attest, and create the prerelease
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'preloopdev/firecracker'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Require a full source commit
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Require the run to be built from the source commit
+        run: |
+          if [[ "$GITHUB_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::GITHUB_SHA $GITHUB_SHA is not SOURCE_SHA $SOURCE_SHA; dispatch from a ref whose head is the source commit." >&2
+            exit 1
+          fi
+      - name: Check out the source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the commit to be on the release branch
+        run: git merge-base --is-ancestor "$SOURCE_SHA" "origin/$SOURCE_BRANCH"
+      - name: Download both architecture packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: runtime-*
+          path: ${{ runner.temp }}/in
+          merge-multiple: true
+      - name: Write the index and checksums
+        run: |
+          python3 tools/preloop-release.py index \
+            --input-dir "$RUNNER_TEMP/in" \
+            --source-commit "$SOURCE_SHA" \
+            --output-dir "$RUNNER_TEMP/release"
+      - name: Attest the index and checksums
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/provenance.json
+            ${{ runner.temp }}/release/SHA256SUMS
+      - name: Create the prerelease (not published)
+        run: |
+          gh release create "$RUNTIME_VERSION" "$RUNNER_TEMP"/release/* \
+            --repo "$GH_REPO" --target "$SOURCE_SHA" --prerelease \
+            --title "Preloop Firecracker $RUNTIME_VERSION (prerelease, not validated)" \
+            --notes "Built by CI from $SOURCE_SHA. Lifecycle validation has not run. Not published."
+      - name: Record the prerelease identifiers
+        run: |
+          gh api "repos/$GH_REPO/releases/tags/$RUNTIME_VERSION" > "$RUNNER_TEMP/release.json"
+          tag_commit=$(gh api "repos/$GH_REPO/git/ref/tags/$RUNTIME_VERSION" --jq '.object.sha')
+          python3 tools/preloop-release.py pins \
+            --release-json "$RUNNER_TEMP/release.json" \
+            --release-dir "$RUNNER_TEMP/release" \
+            --tag-commit "$tag_commit" \
+            --source-commit "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/release-pins.json"
+          cat "$RUNNER_TEMP/release-pins.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Attach release-pins.json to the prerelease
+        run: gh release upload "$RUNTIME_VERSION" "$RUNNER_TEMP/release-pins.json" --repo "$GH_REPO"

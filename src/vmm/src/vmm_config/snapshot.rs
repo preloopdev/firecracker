@@ -46,7 +46,8 @@ pub struct CreateSnapshotParams {
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
-    pub mem_file_path: PathBuf,
+    /// If not specified, only the VM state is saved without memory.
+    pub mem_file_path: Option<PathBuf>,
     /// Whether to fsync the snapshot state and guest memory files.
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]

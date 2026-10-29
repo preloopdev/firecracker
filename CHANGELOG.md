@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0-preloop.1]
+
+### Added
+
+- Port the kvcache-ai fork features to official Firecracker v1.17.0: dirty
+  memory ranges with dirty-bit preservation, guest memory regions including
+  guest physical addresses, optional memory dump on snapshot creation,
+  O_DIRECT drives with aligned bounce buffers, seek-based memory/pmem sizing,
+  and paused-only KVM selective memory prefaulting. Prefaulting is x86_64 only;
+  on aarch64 it returns an explicit unsupported error.
+- Snapshot format is **13.0.0**, not upstream v1.17.0's 12.0.0 or the fork
+  base's 9.0.0: the persisted drive state includes `direct`. Old snapshots must
+  retain their matching runtime; this release provides no format converter.
+- Release archives for x86_64 and aarch64 musl, each with per-architecture
+  provenance, a root index, and SHA256SUMS. Production rollout requires isolated
+  KVM and AgentENV lifecycle validation; neither the release version nor the
+  format version proves compatibility.
+
 ## [1.17.0]
 
 ### Added
@@ -207,6 +225,17 @@ and this project adheres to
 ### Deprecated
 
 ### Removed
+
+### Added
+
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Add
+  runtime `GET /vm/dirty-memory-ranges` API for querying dirty guest memory
+  ranges without first dumping the guest memory snapshot to a file.
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Add
+  paused-only `PUT /vm/pre-fault-memory` for caller-supplied guest-physical
+  ranges. On x86_64 this uses `KVM_PRE_FAULT_MEMORY` when
+  `KVM_CAP_PRE_FAULT_MEMORY` is available; aarch64 reports unsupported. It does
+  not change default startup or snapshot-restore behavior.
 
 ### Fixed
 

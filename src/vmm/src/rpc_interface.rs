@@ -6,9 +6,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
+use vm_memory::GuestMemoryBackend;
 
 use super::builder::build_and_boot_microvm;
-use super::persist::{create_snapshot, restore_from_snapshot};
+use super::persist::{
+    GuestRegionUffdMapping, build_uffd_mappings, create_snapshot, restore_from_snapshot,
+};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -31,7 +34,7 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
@@ -46,6 +49,9 @@ use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
+use crate::vstate::memory::DirtyMemoryRanges;
+use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
+use crate::vstate::vm::VmError;
 
 /// This enum represents the public interface of the VMM. Each action contains various
 /// bits of information (ids, paths, etc.).
@@ -71,6 +77,12 @@ pub enum VmmAction {
     GetBalloonStats,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
+    /// Get dirty guest memory ranges. Post-boot only.
+    GetDirtyMemoryRanges,
+    /// Get guest memory region mappings. Post-boot only.
+    GetGuestMemoryRegions,
+    /// Pre-fault selected guest memory. Paused VM only.
+    PreFaultMemory(PreFaultMemoryRequest),
     /// Get MMDS contents.
     GetMMDS,
     /// Get the machine configuration of the microVM.
@@ -166,6 +178,10 @@ pub enum VmmActionError {
     BootSource(#[from] BootSourceConfigError),
     /// Create snapshot error: {0}
     CreateSnapshot(#[from] CreateSnapshotError),
+    /// Dirty memory ranges error: {0}
+    DirtyMemoryRanges(#[from] VmError),
+    /// Pre-fault memory error: {0}
+    PreFaultMemory(#[from] PreFaultMemoryError),
     /// Configure CPU error: {0}
     ConfigureCpu(#[from] GuestConfigError),
     /// Drive config error: {0}
@@ -233,6 +249,10 @@ pub enum VmmData {
     Empty,
     /// The complete microVM configuration in JSON format.
     FullVmConfig(VmmConfig),
+    /// The dirty guest memory ranges.
+    DirtyMemoryRanges(DirtyMemoryRanges),
+    /// The guest memory region mappings.
+    GuestMemoryRegions(Vec<GuestRegionUffdMapping>),
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(MachineConfig),
     /// Mmds contents.
@@ -500,8 +520,13 @@ impl<'a> PrebootApiController<'a> {
             SetEntropyDevice(config) => self.set_entropy_device(config),
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
+            PreFaultMemory(_) => Err(VmmActionError::PreFaultMemory(
+                PreFaultMemoryError::VmNotPaused(VmState::NotStarted),
+            )),
             CreateSnapshot(_)
             | FlushMetrics
+            | GetDirtyMemoryRanges
+            | GetGuestMemoryRegions
             | Pause
             | Resume
             | GetBalloonStats
@@ -721,6 +746,9 @@ impl RuntimeApiController {
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
+            GetDirtyMemoryRanges => self.get_dirty_memory_ranges(),
+            GetGuestMemoryRegions => self.get_guest_memory_regions(),
+            PreFaultMemory(request) => self.pre_fault_memory(request),
             GetMemoryHotplugStatus => self
                 .vmm
                 .lock()
@@ -892,6 +920,18 @@ impl RuntimeApiController {
         Ok(VmmData::Empty)
     }
 
+    fn pre_fault_memory(
+        &mut self,
+        request: PreFaultMemoryRequest,
+    ) -> Result<VmmData, VmmActionError> {
+        self.vmm
+            .lock()
+            .expect("Poisoned lock")
+            .pre_fault_memory(request)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::PreFaultMemory)
+    }
+
     /// Write the metrics on user demand (flush). We use the word `flush` here to highlight the fact
     /// that the metrics will be written immediately.
     /// Defer to inner Vmm. We'll move to a variant where the Vmm simply exposes functionality like
@@ -954,6 +994,42 @@ impl RuntimeApiController {
             }
         }
         Ok(VmmData::Empty)
+    }
+
+    /// Returns guest memory region mappings for external use (e.g., reading
+    /// guest memory via `process_vm_readv()` or populating snapshot data).
+    ///
+    /// The `offset` field in each returned mapping is a cumulative byte offset into
+    /// a contiguous layout of all regions (i.e., the position where this region's
+    /// data would start if all regions were concatenated in order). This matches
+    /// the semantics used in the uffd restore path (`create_guest_memory` in
+    /// `persist.rs`), where `offset` represents the position within the snapshot
+    /// file/buffer — **not** the Guest Physical Address (GPA). Note that GPAs may
+    /// have gaps (e.g., the MMIO hole near 4 GiB), but the snapshot layout is
+    /// contiguous.
+    fn get_guest_memory_regions(&self) -> Result<VmmData, VmmActionError> {
+        let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+        let kvm_vm = locked_vmm.vm.as_kvm().ok_or(VmmActionError::NotSupported(
+            "guest memory regions require KVM".into(),
+        ))?;
+        let guest_memory = kvm_vm.guest_memory();
+        let huge_pages = locked_vmm.machine_config.huge_pages;
+        let mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
+        Ok(VmmData::GuestMemoryRegions(mappings))
+    }
+
+    /// Returns dirty memory ranges for external snapshot packaging.
+    ///
+    /// The query is logically non-clearing: if reading KVM's dirty log clears
+    /// KVM state, the VM stores those dirty bits back into Firecracker's
+    /// internal bitmap before this method returns.
+    fn get_dirty_memory_ranges(&self) -> Result<VmmData, VmmActionError> {
+        let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+        let kvm_vm = locked_vmm.vm.as_kvm().ok_or(VmmActionError::NotSupported(
+            "dirty memory ranges require KVM".into(),
+        ))?;
+        let ranges = kvm_vm.get_dirty_memory_ranges_preserve()?;
+        Ok(VmmData::DirtyMemoryRanges(ranges))
     }
 
     /// Updates block device properties:
@@ -1211,6 +1287,22 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::Pause));
         check_unsupported(preboot_request(VmmAction::Resume));
         check_unsupported(preboot_request(VmmAction::GetBalloonStats));
+        check_unsupported(preboot_request(VmmAction::GetDirtyMemoryRanges));
+        check_unsupported(preboot_request(VmmAction::GetGuestMemoryRegions));
+        let pre_fault_result = preboot_request(VmmAction::PreFaultMemory(
+            PreFaultMemoryRequest {
+                ranges: vec![crate::vstate::prefault::PreFaultMemoryRange {
+                    gpa: 0,
+                    size: 0x1000,
+                }],
+            },
+        ));
+        assert!(matches!(
+            pre_fault_result,
+            Err(VmmActionError::PreFaultMemory(
+                PreFaultMemoryError::VmNotPaused(VmState::NotStarted)
+            ))
+        ));
         check_unsupported(preboot_request(VmmAction::UpdateBalloon(
             BalloonUpdateConfig { amount_mib: 0 },
         )));
@@ -1241,7 +1333,7 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
                 sync_snapshot_files: true,
             },
         )));
@@ -1267,6 +1359,40 @@ mod tests {
             runtime_request(VmmAction::GetVmMachineConfig).unwrap(),
             VmmData::MachineConfiguration(MachineConfig::default())
         );
+    }
+
+    #[test]
+    fn test_runtime_get_guest_memory_regions() {
+        let result = runtime_request(VmmAction::GetGuestMemoryRegions).unwrap();
+        match result {
+            VmmData::GuestMemoryRegions(regions) => {
+                assert!(!regions.is_empty());
+                let mut expected_offset = 0u64;
+                for region in &regions {
+                    assert_ne!(region.base_host_virt_addr, 0);
+                    assert_ne!(region.size, 0);
+                    assert_eq!(region.page_size, 4096);
+                    assert_eq!(
+                        region.offset, expected_offset,
+                        "offset should be cumulative sum of preceding region sizes"
+                    );
+                    expected_offset += region.size as u64;
+                }
+            }
+            other => panic!("Expected GuestMemoryRegions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_runtime_get_dirty_memory_ranges() {
+        let result = runtime_request(VmmAction::GetDirtyMemoryRanges).unwrap();
+        match result {
+            VmmData::DirtyMemoryRanges(dirty_ranges) => {
+                assert_eq!(dirty_ranges.page_size, 4096);
+                assert_ne!(dirty_ranges.memory_size, 0);
+            }
+            other => panic!("Expected DirtyMemoryRanges, got {:?}", other),
+        }
     }
 
     #[test]

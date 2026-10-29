@@ -9,6 +9,159 @@ container and function workloads.
 
 Read more about the Firecracker Charter [here](CHARTER.md).
 
+## Preloop fork runtime
+
+This fork ports the kvcache-ai runtime patch set onto official Firecracker
+v1.17.0 (`95f868c8e345b1cc8faccd1a3c910b4989dc3f58`). The release contract is
+`resources/preloop-runtime.json` (schema 4); the runtime key is `v1.17.0-preloop.1`.
+
+The snapshot format is **13.0.0**. Upstream v1.17.0 writes 12.0.0, and the fork
+base writes 9.0.0. Neither is converted, and there is no compatibility promise:
+keep each snapshot with the runtime that wrote it.
+
+KVM selective pre-fault (`PUT /vm/pre-fault-memory`) is **x86_64 only**. On
+aarch64 it returns `pre-fault memory is unsupported on this architecture`.
+Stock Firecracker binaries do not implement the fork API.
+
+Branches: `preloop/runtime-v1.17.0` is this fork's default branch and the release line.
+The release workflow exists only there, so `workflow_dispatch` can see it.
+`preloop/stable-v1.17.0` remains the upstream v1.17.0 base (the pull request base);
+it does not contain the release workflow.
+
+### Release assets
+
+Each release has one archive per architecture in the contract:
+
+- `firecracker-v1.17.0-preloop.1-x86_64.tgz`
+- `firecracker-v1.17.0-preloop.1-aarch64.tgz`
+
+Each archive contains `firecracker`, `jailer`, and `cpu-template-helper`, each named
+`<name>-v1.17.0-preloop.1-<arch>`, plus the API spec, seccomp filter, CPU templates,
+licenses, and the release contract. The release set omits `seccompiler-bin`,
+`rebase-snap`, and `snapshot-editor`: they are development tools, and a musl
+`seccompiler-bin` build failed to link against the glibc `libseccomp.a` in the build
+environment. The contract's `omitted_binaries` records each omission, and every
+provenance and index repeats it.
+
+`provenance-<arch>.json` records the archive digest, each shipped binary's digest and
+rustc identity, the builder, the build packages, and the patch-to-port map.
+`provenance.json` indexes both architectures, and `SHA256SUMS` covers every file. The
+index says whether the set is `complete`. `release-pins.json` is attached to the
+prerelease after it is created, so it is not in `SHA256SUMS`. It lists the release and
+asset IDs, sizes, and digests that the lifecycle gate pins.
+
+Each provenance records one `build_origin`:
+
+- `github-actions`: `.github/workflows/preloop-runtime-release.yml` builds each
+  architecture on its native runner from a clean `source_sha` on
+  `preloop/runtime-v1.17.0` with `cargo --frozen`, packages it, and attests the
+  archive and provenance with `actions/attest-build-provenance`.
+- `local-build-record`: `tools/preloop-release.py package --build-record` packages a
+  builder's binaries after matching their digests to the record. It has no GitHub
+  attestation, so provisioning must not treat it as production.
+
+Local packaging requires `git fetch origin preloop/runtime-v1.17.0`, a clean tree outside
+`target/`, and a builder record with `schema_version` 4, `build_origin`
+`local-build-record`, `source_commit`, `arch`, `target`, `cargo_lock_sha256`,
+`rustc_verbose` (the full `rustc +1.97.0 -Vv` output), `builder_host`, `build_commands`
+(must include a `--frozen --release` build of every package for the target), and
+`binary_sha256` for each shipped binary:
+
+```sh
+python3 tools/preloop-release.py package --arch x86_64 \
+  --binary-dir target/x86_64-unknown-linux-musl/release \
+  --source-commit <full sha> --build-record build-record-x86_64.json \
+  --output-dir out/x86_64
+mkdir -p out/in && cp out/x86_64/* out/in/   # add out/aarch64/* once it exists
+python3 tools/preloop-release.py index --input-dir out/in \
+  --source-commit <full sha> --output-dir out/index
+```
+
+Add `--allow-missing-architectures` to `index` only for an explicitly partial
+(`complete: false`) set, and never use a partial set as the default manifest.
+
+### Build commands
+
+x86_64 (native on Linux x86_64):
+
+```sh
+rustup toolchain install 1.97.0 --profile minimal --target x86_64-unknown-linux-musl
+cargo +1.97.0 fetch --locked --target x86_64-unknown-linux-musl
+CARGO_BUILD_JOBS=2 cargo +1.97.0 build --frozen --release --target x86_64-unknown-linux-musl \
+  -p firecracker -p jailer -p cpu-template-helper
+```
+
+aarch64 (cross from x86_64 Linux; substitute the musl cross compiler you have installed):
+
+```sh
+AARCH64_MUSL_CC=/path/to/aarch64-linux-musl-gcc
+AARCH64_MUSL_AR=/path/to/aarch64-linux-musl-ar
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$AARCH64_MUSL_CC"
+export CC_aarch64_unknown_linux_musl="$AARCH64_MUSL_CC"
+export AR_aarch64_unknown_linux_musl="$AARCH64_MUSL_AR"
+rustup toolchain install 1.97.0 --profile minimal --target aarch64-unknown-linux-musl
+cargo +1.97.0 fetch --locked --target aarch64-unknown-linux-musl
+CARGO_BUILD_JOBS=2 cargo +1.97.0 build --frozen --release --target aarch64-unknown-linux-musl \
+  -p firecracker -p jailer -p cpu-template-helper
+```
+
+The aarch64 cross link has not been verified by any run. Treat it as a build risk until
+the link succeeds and the packager's ELF checks pass.
+
+### Verify before use
+
+```sh
+gh attestation verify firecracker-v1.17.0-preloop.1-x86_64.tgz \
+  --repo preloopdev/firecracker \
+  --signer-workflow preloopdev/firecracker/.github/workflows/preloop-runtime-release.yml \
+  --source-digest <source_commit from provenance-x86_64.json>
+sha256sum --check SHA256SUMS
+```
+
+Then extract the archive and compare each `binary_sha256` in `provenance-<arch>.json`
+with the extracted binary. Attestations exist only for `github-actions` builds.
+
+### Release sequence
+
+1. The `index` job creates a **prerelease** (never published), attests the index and
+   checksums, writes `release-pins.json` (release, tag, and asset IDs with sizes and
+   SHA-256 values; it excludes itself), and attaches that file to the prerelease as a
+   release asset.
+2. Isolated KVM and AgentENV lifecycle validation runs on the exact asset bytes, using
+   the pinned asset IDs and digests.
+3. After validation passes, attach the evidence and publish:
+
+```sh
+gh release upload v1.17.0-preloop.1 validation-evidence.json --repo preloopdev/firecracker
+gh release edit v1.17.0-preloop.1 --repo preloopdev/firecracker --prerelease=false --latest
+```
+
+The build workflow takes no validation input and never publishes or deploys.
+
+Dispatch the workflow from the default branch. The dispatch ref's head must be the source
+commit, because the workflow refuses to run unless `GITHUB_SHA` equals `source_sha`:
+
+```sh
+gh workflow run preloop-runtime-release.yml --repo preloopdev/firecracker \
+  --ref preloop/runtime-v1.17.0 -f source_sha=<full sha of the preloop/runtime-v1.17.0 head>
+```
+
+When GitHub Actions is unavailable, run `index` locally, create the prerelease from the
+index output directory with `gh release create ... --prerelease --target <sha>`, fetch its
+JSON with `gh api repos/preloopdev/firecracker/releases/tags/v1.17.0-preloop.1`, run
+`pins` on that JSON, and attach `release-pins.json` with `gh release upload`. A locally
+generated pins file records `generated_in_actions: false`.
+
+### Validation scope
+
+Compiling is not runtime evidence. Before publishing, run the ported unit and
+integration tests and the KVM checks against the exact released binaries and default
+seccomp filters: dirty ranges preserve state; GPA holes differ from image offsets;
+state-only and full/diff snapshots restore; sync and async O_DIRECT handle aligned and
+unaligned buffers; memory and pmem sizes use seek; prefault validates, recovers its
+control channel, and (x86_64 only) behaves as specified. No aarch64 runtime validation
+exists yet.
+
 ## What is Firecracker?
 
 Firecracker is an open source virtualization technology that is purpose-built

@@ -26,6 +26,7 @@ use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::{parse_patch_pmem, parse_put_pmem};
+use super::request::prefault::parse_put_pre_fault_memory;
 use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
@@ -85,9 +86,19 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "", None) => parse_get_instance_info(),
             (Method::Get, "balloon", None) => parse_get_balloon(path_tokens),
             (Method::Get, "version", None) => parse_get_version(),
-            (Method::Get, "vm", None) if path_tokens.next() == Some("config") => {
-                Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
-            }
+            (Method::Get, "vm", None) => match path_tokens.next() {
+                Some("config") => Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig)),
+                Some("dirty-memory-ranges") => {
+                    Ok(ParsedRequest::new_sync(VmmAction::GetDirtyMemoryRanges))
+                }
+                Some("guest-memory-regions") => {
+                    Ok(ParsedRequest::new_sync(VmmAction::GetGuestMemoryRegions))
+                }
+                _ => Err(RequestError::InvalidPathMethod(
+                    "vm".to_string(),
+                    Method::Get,
+                )),
+            },
             (Method::Get, "machine-config", None) => parse_get_machine_config(),
             (Method::Get, "mmds", None) => parse_get_mmds(),
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
@@ -104,6 +115,12 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
             (Method::Put, "machine-config", Some(body)) => parse_put_machine_config(body),
             (Method::Put, "metrics", Some(body)) => parse_put_metrics(body),
+            (Method::Put, "vm", Some(body))
+                if path_tokens.next() == Some("pre-fault-memory")
+                    && path_tokens.next().is_none() =>
+            {
+                parse_put_pre_fault_memory(body)
+            }
             (Method::Put, "mmds", Some(body)) => parse_put_mmds(body, path_tokens.next()),
             (Method::Put, "network-interfaces", Some(body)) => {
                 parse_put_net(body, path_tokens.next())
@@ -211,6 +228,8 @@ impl ParsedRequest {
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+                VmmData::DirtyMemoryRanges(ranges) => Self::success_response_with_data(ranges),
+                VmmData::GuestMemoryRegions(regions) => Self::success_response_with_data(regions),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -361,11 +380,13 @@ pub mod tests {
     use vmm::builder::StartMicrovmError;
     use vmm::cpu_config::templates::test_utils::build_test_template;
     use vmm::devices::virtio::balloon::device::HintingStatus;
+    use vmm::persist::GuestRegionUffdMapping;
     use vmm::resources::VmmConfig;
     use vmm::rpc_interface::VmmActionError;
     use vmm::vmm_config::balloon::{BalloonDeviceConfig, BalloonStats};
     use vmm::vmm_config::instance_info::InstanceInfo;
     use vmm::vmm_config::machine_config::MachineConfig;
+    use vmm::vstate::memory::{DirtyMemoryRange, DirtyMemoryRanges};
 
     use super::*;
 
@@ -436,6 +457,21 @@ pub mod tests {
         format!("{}\r\n", req_no_body,)
     }
 
+    fn parse_http_request(
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<ParsedRequest, RequestError> {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        sender
+            .write_all(http_request(method, path, body).as_bytes())
+            .unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        connection.try_read().unwrap();
+        let request = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&request)
+    }
+
     #[test]
     fn test_missing_slash() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
@@ -494,6 +530,60 @@ pub mod tests {
             &parsed_request,
             Err(RequestError::Generic(StatusCode::BadRequest, s)) if s == "Empty PUT request.",
         ));
+    }
+
+    #[test]
+    fn test_put_pre_fault_memory_route() {
+        let body = r#"{"ranges":[{"gpa":4096,"size":16384}]}"#;
+        assert_eq!(
+            vmm_action_from_request(
+                parse_http_request("PUT", "/vm/pre-fault-memory", Some(body)).unwrap()
+            ),
+            VmmAction::PreFaultMemory(vmm::vstate::prefault::PreFaultMemoryRequest {
+                ranges: vec![vmm::vstate::prefault::PreFaultMemoryRange {
+                    gpa: 4096,
+                    size: 16384,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn test_pre_fault_memory_route_rejects_invalid_request() {
+        for (method, path, body) in [
+            ("PUT", "/vm/pre-fault-memory", None),
+            ("GET", "/vm/pre-fault-memory", None),
+            (
+                "PUT",
+                "/vm/pre-fault-memory/extra",
+                Some(r#"{"ranges":[{"gpa":4096,"size":4096}]}"#),
+            ),
+        ] {
+            assert!(
+                parse_http_request(method, path, body).is_err(),
+                "{method} {path}"
+            );
+        }
+
+        let body = r#"{"ranges":[{"gpa":4096,"size":4096,"extra":true}]}"#;
+        parse_http_request("PUT", "/vm/pre-fault-memory", Some(body)).unwrap_err();
+    }
+
+    #[test]
+    fn test_pre_fault_memory_errors_are_bad_request() {
+        for error in [
+            vmm::vstate::prefault::PreFaultMemoryError::CapabilityMissing,
+            vmm::vstate::prefault::PreFaultMemoryError::VmNotPaused(
+                vmm::vmm_config::instance_info::VmState::Running,
+            ),
+            vmm::vstate::prefault::PreFaultMemoryError::Validation(
+                vmm::vstate::prefault::PreFaultMemoryValidationError::EmptyRanges,
+            ),
+        ] {
+            let response =
+                ParsedRequest::convert_to_response(&Err(VmmActionError::PreFaultMemory(error)));
+            assert_eq!(response.status(), StatusCode::BadRequest);
+        }
     }
 
     #[test]
@@ -616,6 +706,12 @@ pub mod tests {
                 VmmData::FullVmConfig(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
                 }
+                VmmData::DirtyMemoryRanges(ranges) => {
+                    http_response(&serde_json::to_string(ranges).unwrap(), 200)
+                }
+                VmmData::GuestMemoryRegions(regions) => {
+                    http_response(&serde_json::to_string(regions).unwrap(), 200)
+                }
                 VmmData::MachineConfiguration(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
                 }
@@ -646,10 +742,28 @@ pub mod tests {
         }));
         verify_ok_response_with(VmmData::Empty);
         verify_ok_response_with(VmmData::FullVmConfig(VmmConfig::default()));
+        verify_ok_response_with(VmmData::DirtyMemoryRanges(DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 8192,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: 0x7f0000000000,
+                image_offset: 0,
+                length: 4096,
+            }],
+        }));
         verify_ok_response_with(VmmData::MachineConfiguration(MachineConfig::default()));
         verify_ok_response_with(VmmData::MmdsValue(serde_json::from_str("{}").unwrap()));
         verify_ok_response_with(VmmData::InstanceInformation(InstanceInfo::default()));
         verify_ok_response_with(VmmData::VmmVersion(String::default()));
+        #[allow(deprecated)]
+        verify_ok_response_with(VmmData::GuestMemoryRegions(vec![GuestRegionUffdMapping {
+            base_host_virt_addr: 0x7f0000000000,
+            guest_phys_addr: 0,
+            size: 0x10000000,
+            offset: 0,
+            page_size: 4096,
+            page_size_kib: 4096,
+        }]));
 
         // Error.
         let error = VmmActionError::StartMicrovm(StartMicrovmError::MissingKernelConfig);
@@ -744,6 +858,38 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_get_guest_memory_regions() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/vm/guest-memory-regions", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed),
+            VmmAction::GetGuestMemoryRegions
+        );
+    }
+
+    #[test]
+    fn test_try_from_get_dirty_memory_ranges() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/vm/dirty-memory-ranges", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed),
+            VmmAction::GetDirtyMemoryRanges
+        );
     }
 
     #[test]

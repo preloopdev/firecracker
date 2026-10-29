@@ -791,6 +791,26 @@
                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
             },
             {
+                "syscall": "ioctl",
+                "comment": "Query selective guest-memory prefault capability",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 44547,
+                        "comment": "KVM_CHECK_EXTENSION"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 236,
+                        "comment": "KVM_CAP_PRE_FAULT_MEMORY"
+                    }
+                ]
+            },
+            {
                 "syscall": "mprotect",
                 "comment": "Used by memory hotplug to protect access to underlying host memory",
                 "args": [
@@ -1349,6 +1369,18 @@
                         "op": "eq",
                         "val": 44672,
                         "comment": "KVM_RUN"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3225464533,
+                        "comment": "KVM_PRE_FAULT_MEMORY"
                     }
                 ]
             },

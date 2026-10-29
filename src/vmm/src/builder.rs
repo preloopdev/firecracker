@@ -908,6 +908,7 @@ pub(crate) mod tests {
                 file_engine_type: None,
                 blk_size: None,
                 topology: None,
+                direct: None,
 
                 socket: None,
             };
