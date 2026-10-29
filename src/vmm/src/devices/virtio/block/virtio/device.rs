@@ -1066,6 +1066,7 @@ mod tests {
             file_engine_type: FileEngineType::Sync,
             blk_size: Some(4096),
             topology: None,
+            direct: false,
         };
 
         let mut block = VirtioBlock::new(config).unwrap();
@@ -1094,6 +1095,7 @@ mod tests {
             file_engine_type: FileEngineType::Async,
             blk_size: None,
             topology: None,
+            direct: false,
         };
         assert!(matches!(
             VirtioBlock::new(async_config),
@@ -1114,6 +1116,7 @@ mod tests {
             file_engine_type: FileEngineType::Sync,
             blk_size: None,
             topology: None,
+            direct: false,
         };
         assert!(matches!(
             VirtioBlock::new(read_only_config),
@@ -1137,6 +1140,7 @@ mod tests {
             file_engine_type: FileEngineType::Sync,
             blk_size: None,
             topology: None,
+            direct: false,
         };
 
         let mut block = VirtioBlock::new(config).unwrap();

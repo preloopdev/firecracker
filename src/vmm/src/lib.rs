@@ -125,7 +125,6 @@ use std::time::Duration;
 use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use kvm_bindings::KVM_CAP_PRE_FAULT_MEMORY;
-use seccomp::BpfProgram;
 use snapshot::Persist;
 use vm_memory::GuestMemoryBackend;
 use vmm_sys_util::epoll::EventSet;
@@ -503,7 +502,12 @@ impl Vmm {
                 self.instance_info.state.clone(),
             ));
         }
-        if self.vcpus_handles.is_empty() {
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or(PreFaultMemoryError::CapabilityMissing)?;
+        let mut handles = kvm_vm.vcpus_handles();
+        if handles.is_empty() {
             return Err(PreFaultMemoryError::NoVcpus);
         }
 
@@ -512,7 +516,7 @@ impl Vmm {
             // `Hotpluggable` (virtio-mem) region is rejected: a single active virtio-mem block
             // can mark its whole KVM slot as plugged without every byte belonging to the guest,
             // so plugged-slot coverage is not a safe proxy for guest-owned memory here.
-            let guest_memory = self.vm.guest_memory();
+            let guest_memory = kvm_vm.guest_memory();
             let mut all_dram = true;
             let covered = guest_memory
                 .try_for_each_region_in_range(
@@ -529,8 +533,8 @@ impl Vmm {
             }
         }
 
-        if self
-            .kvm
+        if kvm_vm
+            .kvm()
             .fd
             .check_extension_raw(u64::from(KVM_CAP_PRE_FAULT_MEMORY))
             == 0
@@ -538,12 +542,12 @@ impl Vmm {
             return Err(PreFaultMemoryError::CapabilityMissing);
         }
 
-        let work = split_pre_fault_ranges(&request.ranges, self.vcpus_handles.len())?;
+        let work = split_pre_fault_ranges(&request.ranges, handles.len())?;
 
         // Send every work queue before waiting for any response. This lets the kernel fault pages
         // on all vCPU threads concurrently.
         let send_error = send_pre_fault_events(&work, |vcpu_id, ranges| {
-            self.vcpus_handles[vcpu_id].send_event(VcpuEvent::PreFaultMemory(ranges))
+            handles[vcpu_id].send_event(VcpuEvent::PreFaultMemory(ranges))
         });
 
         // Drain every response for every worker whose send_event call returned, even after one
@@ -551,7 +555,7 @@ impl Vmm {
         // blocking receive because a fixed timeout could leave a completed response queued and
         // have the next Resume/Save operation consume it.
         let response_error = drain_pre_fault_responses(work.len(), |vcpu_id| {
-            self.vcpus_handles[vcpu_id].response_receiver().recv()
+            handles[vcpu_id].response_receiver().recv()
         });
         match send_error
             .map(|(vcpu_id, source)| PreFaultMemoryError::VcpuSend { vcpu_id, source })

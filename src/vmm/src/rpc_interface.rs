@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
+use vm_memory::GuestMemoryBackend;
 
 use super::builder::build_and_boot_microvm;
 use super::persist::{
@@ -26,7 +27,6 @@ use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::HotplugDeviceConfig;
-use crate::vstate::memory::GuestMemory;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -49,7 +49,7 @@ use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
-use crate::vstate::memory::{DirtyMemoryRanges, GuestMemory};
+use crate::vstate::memory::DirtyMemoryRanges;
 use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
 use crate::vstate::vm::VmError;
 
@@ -1009,7 +1009,10 @@ impl RuntimeApiController {
     /// contiguous.
     fn get_guest_memory_regions(&self) -> Result<VmmData, VmmActionError> {
         let locked_vmm = self.vmm.lock().expect("Poisoned lock");
-        let guest_memory = locked_vmm.vm.guest_memory();
+        let kvm_vm = locked_vmm.vm.as_kvm().ok_or(VmmActionError::NotSupported(
+            "guest memory regions require KVM".into(),
+        ))?;
+        let guest_memory = kvm_vm.guest_memory();
         let huge_pages = locked_vmm.machine_config.huge_pages;
         let mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
         Ok(VmmData::GuestMemoryRegions(mappings))
@@ -1022,7 +1025,10 @@ impl RuntimeApiController {
     /// internal bitmap before this method returns.
     fn get_dirty_memory_ranges(&self) -> Result<VmmData, VmmActionError> {
         let locked_vmm = self.vmm.lock().expect("Poisoned lock");
-        let ranges = locked_vmm.vm.get_dirty_memory_ranges_preserve()?;
+        let kvm_vm = locked_vmm.vm.as_kvm().ok_or(VmmActionError::NotSupported(
+            "dirty memory ranges require KVM".into(),
+        ))?;
+        let ranges = kvm_vm.get_dirty_memory_ranges_preserve()?;
         Ok(VmmData::DirtyMemoryRanges(ranges))
     }
 

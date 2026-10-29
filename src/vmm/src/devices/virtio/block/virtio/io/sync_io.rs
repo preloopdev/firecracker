@@ -9,7 +9,7 @@ use std::os::unix::fs::FileTypeExt;
 use vm_memory::{GuestMemoryBackend, GuestMemoryError, ReadVolatile, WriteVolatile};
 
 use super::{AlignedBuf, DIRECT_IO_ALIGN};
-use crate::vstate::memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use crate::vstate::memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum SyncIoError {

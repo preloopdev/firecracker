@@ -16,7 +16,7 @@ use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
 use crate::logger::log_dev_preview_warning;
 use crate::vstate::memory::{
-    Bytes, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap,
+    Bytes, GuestAddress, GuestMemoryExtension, GuestMemoryMmap,
 };
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]

@@ -65,8 +65,6 @@ pub struct VirtioBlockState {
     topology: VirtioBlkTopology,
     discard_sector_alignment: u32,
     /// Whether O_DIRECT was used to open the backing file.
-    /// Uses serde default (false) for backward compatibility with older snapshots.
-    #[serde(default)]
     direct: bool,
 }
 

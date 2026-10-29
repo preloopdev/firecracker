@@ -7,7 +7,6 @@ use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
-use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -16,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
-use vm_memory::{Address, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemoryRegion, MemoryRegionAddress};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -42,7 +41,7 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestMmapRegion, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -171,7 +170,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -603,7 +602,7 @@ fn guest_memory_from_uffd(
 /// regions, and the page size from the given [`HugePageConfig`]. This is the
 /// single source of truth for constructing these mappings — used by both the
 /// uffd restore path and the runtime `GET /vm/guest-memory-regions` API.
-pub fn build_uffd_mappings<'a, R: Deref<Target = GuestMmapRegion> + GuestMemoryRegion + 'a>(
+pub fn build_uffd_mappings<'a, R: GuestMemoryRegion + 'a>(
     regions: impl Iterator<Item = &'a R>,
     huge_pages: HugePageConfig,
 ) -> Vec<GuestRegionUffdMapping> {
@@ -612,14 +611,16 @@ pub fn build_uffd_mappings<'a, R: Deref<Target = GuestMmapRegion> + GuestMemoryR
     for mem_region in regions {
         #[allow(deprecated)]
         mappings.push(GuestRegionUffdMapping {
-            base_host_virt_addr: mem_region.as_ptr() as u64,
+            base_host_virt_addr: mem_region
+                .get_host_address(MemoryRegionAddress(0))
+                .expect("memory regions are nonempty") as u64,
             guest_phys_addr: mem_region.start_addr().raw_value(),
-            size: mem_region.size(),
+            size: u64_to_usize(mem_region.len()),
             offset,
             page_size: huge_pages.page_size(),
             page_size_kib: huge_pages.page_size(),
         });
-        offset += mem_region.size() as u64;
+        offset += mem_region.len();
     }
     mappings
 }
@@ -630,7 +631,7 @@ fn create_guest_memory(
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
     let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
-    let backend_mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
+    let backend_mappings = build_uffd_mappings(guest_memory.iter().map(|region| &**region), huge_pages);
     Ok((guest_memory, backend_mappings))
 }
 
